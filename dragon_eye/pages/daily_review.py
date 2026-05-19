@@ -4,6 +4,8 @@
 核心理念：每一个结论都有具体数字支撑。
 """
 import streamlit as st
+import json
+import os
 from datetime import datetime
 
 
@@ -32,12 +34,14 @@ def _get_sector_mapper():
     return m
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _get_stock_names():
-    """股票代码→名称"""
-    from dragon_eye.dataflows.dragon_eye_vendor import _get_dbf_reader
-    dbf = _get_dbf_reader()
-    return getattr(dbf, '_code_to_name', {})
+    """股票代码→名称（从缓存JSON）"""
+    names_path = os.path.join(os.path.dirname(__file__), "..", "_cache", "stock_names.json")
+    if os.path.exists(names_path):
+        with open(names_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -169,10 +173,30 @@ def _get_stocks_in_sector(sector_name: str, sector_type: str, mapper) -> set:
         stocks = mapper._concept_map.get(sector_name, [])
         codes = set(stocks)
     else:
-        for code, ind in mapper._industry_map.items():
-            if ind == sector_name:
-                codes.add(code)
+        # 行业：通过 AKShare 获取 THS 行业成分股（与 sector_heat 口径一致）
+        codes = _get_ths_industry_stocks(sector_name)
     return codes
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_ths_industry_stocks(sector_name: str) -> set:
+    """获取同花顺行业成分股（缓存1小时）"""
+    try:
+        import akshare as ak
+        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+            os.environ.pop(k, None)
+        os.environ["NO_PROXY"] = "eastmoney.com,push2.eastmoney.com,localhost,127.0.0.1"
+        df = ak.stock_board_industry_cons_em(symbol=sector_name)
+        if df is not None and not df.empty:
+            codes = set()
+            for _, row in df.iterrows():
+                code = str(row.get("代码", ""))
+                if len(code) == 6 and code.isdigit():
+                    codes.add(code)
+            return codes
+    except Exception:
+        pass
+    return set()
 
 
 def _calc_sector_change(codes: set, stats) -> dict:
@@ -298,7 +322,7 @@ def _assess_market_overview() -> dict:
             if stat.change_pct <= -9.8:
                 limit_down += 1
 
-        total_amount += stat.amount
+        total_amount += stat.amount  # stat.amount is in 元, from tdxstat.cfg field[22]
         valid += 1
 
     total = up_count + down_count + flat_count
@@ -430,7 +454,7 @@ def _render_review_report(results: dict):
         with col5:
             st.metric("涨跌比", f"{overview.get('up_ratio', 0):.0%}")
         with col6:
-            total_yi = overview.get('total_amount', 0) / 1e8
+            total_yi = overview.get('total_amount', 0) / 1e8  # 元→亿
             st.metric("成交额", f"{total_yi:.0f}亿")
 
         mood = overview.get("mood", "")
@@ -449,10 +473,11 @@ def _render_review_report(results: dict):
             breadth_bar = _breadth_bar(t.get("breadth", 0))
 
             leader = ""
-            if t.get("leader_name"):
+            if t.get("leader_code"):
+                leader_name = t.get("leader_name", "") or t["leader_code"]
                 chg_str = f"{t['leader_chg']:+.2f}%"
                 chg_icon = "🔴" if t['leader_chg'] > 0 else "🟢"
-                leader = f"{chg_icon} {t['leader_name']}({t['leader_code']}) {chg_str}"
+                leader = f"{chg_icon} {leader_name}({t['leader_code']}) {chg_str}"
 
             rows.append({
                 "#": i,
