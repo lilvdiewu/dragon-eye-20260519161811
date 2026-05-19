@@ -275,71 +275,43 @@ def _render_concept_sectors():
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("数据不足")
-            )
-        ])
-        fig.update_layout(
-            height=500,
-            margin=dict(l=120, r=30, t=30, b=20),
-            xaxis_title="涨跌幅%",
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ---- 概念详情 ----
-    st.divider()
-    st.subheader("查看概念详情")
-    concept_names = [s.name for s in sectors]
-    selected_concept = st.selectbox("选择概念板块", concept_names, key="concept_detail_select")
-
-    if st.button("📊 查看概念详情", key="view_concept_detail"):
-        with st.spinner(f"正在获取 {selected_concept} 成分股..."):
-            from dragon_eye.sector.ths_sector import ThsSectorFetcher
-            fetcher = ThsSectorFetcher()
-            detail = fetcher.get_concept_detail(selected_concept)
-
-        if detail and detail.get("stocks"):
-            st.success(f"**{selected_concept}** 共 {detail['stock_count']} 只成分股")
-            stock_rows = detail["stocks"][:50]
-            st.dataframe(stock_rows, use_container_width=True, hide_index=True)
-        else:
-            st.warning("成分股数据获取失败")
 
 
 def _render_sector_compare():
-    """板块对比分析"""
-    st.subheader("板块对比")
+    """板块对比（行业 vs 概念）"""
+    st.subheader("行业 vs 概念 对比")
+
+    industry_sectors = _cached_industry_sectors()
+    concept_sectors = _cached_concept_sectors_tdx()
 
     col1, col2 = st.columns(2)
     with col1:
-        industry_sectors = _cached_industry_sectors()
-        industry_names = [s.name for s in industry_sectors]
-        selected_industries = st.multiselect(
+        ind_names = [s.name for s in industry_sectors]
+        selected_inds = st.multiselect(
             "选择行业板块（最多5个）",
-            industry_names,
-            default=industry_names[:3] if len(industry_names) >= 3 else industry_names,
+            ind_names,
+            default=ind_names[:3] if len(ind_names) >= 3 else ind_names,
             max_selections=5,
             key="compare_industry",
         )
     with col2:
-        concept_sectors = _cached_concept_sectors()
-        concept_names = [s.name for s in concept_sectors]
-        selected_concepts = st.multiselect(
+        con_names = [s.name for s in concept_sectors]
+        selected_cons = st.multiselect(
             "选择概念板块（最多5个）",
-            concept_names,
-            default=concept_names[:2] if len(concept_names) >= 2 else concept_names,
+            con_names,
+            default=con_names[:2] if len(con_names) >= 2 else con_names,
             max_selections=5,
             key="compare_concept",
         )
 
     if st.button("📈 开始对比", key="start_compare"):
-        # 构建对比数据
         all_selected = []
         for s in industry_sectors:
-            if s.name in selected_industries:
+            if s.name in selected_inds:
                 s.sector_type = "industry"
                 all_selected.append(s)
         for s in concept_sectors:
-            if s.name in selected_concepts:
+            if s.name in selected_cons:
                 s.sector_type = "concept"
                 all_selected.append(s)
 
@@ -347,36 +319,34 @@ def _render_sector_compare():
             st.warning("请至少选择一个板块")
             return
 
-        # 对比表格
         rows = []
         for s in all_selected:
             type_label = "🏭" if s.sector_type == "industry" else "💡"
+            stock_cnt = getattr(s, 'stock_count', 0) or 0
             rows.append({
                 "类型": type_label,
                 "板块": s.name,
-                "涨跌幅": s.change_pct,
+                "涨跌幅": f"{s.change_pct:+.2f}%" if s.change_pct else "——",
                 "强度分": s.strength_score,
                 "等级": s.grade,
-                "净流入(亿)": round(s.net_inflow, 2),
-                "轮动信号": s.rotation_signal,
+                "成分股数": stock_cnt if s.sector_type == "concept" else "——",
             })
 
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
-        # 涨跌幅对比柱状图
         fig = go.Figure(data=[
             go.Bar(
                 x=[s.name for s in all_selected],
-                y=[s.change_pct for s in all_selected],
-                marker_color=["#ff4b4b" if s.change_pct > 0 else "#4baf4f" for s in all_selected],
-                text=[f"{s.change_pct:+.2f}%" for s in all_selected],
+                y=[s.strength_score for s in all_selected],
+                marker_color=["#1f77b4" if s.sector_type == "industry" else "#ff7f0e" for s in all_selected],
+                text=[f"{s.strength_score:.0f}" for s in all_selected],
                 textposition="outside",
             )
         ])
         fig.update_layout(
-            title="涨跌幅对比",
+            title="强度分对比（蓝=行业 / 橙=概念）",
             height=350,
-            margin=dict(l=20, r=20, t=40, b=60),
+            margin=dict(l=20, r=20, t=40, b=80),
             xaxis_tickangle=-30,
         )
         st.plotly_chart(fig, use_container_width=True)
