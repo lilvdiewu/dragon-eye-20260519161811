@@ -32,14 +32,16 @@ from dragon_eye.sector.tdx_sector_reader import TdxSectorReader
 # ============================================================
 
 FACTOR_WEIGHTS = {
-    "strength": 0.20,
-    "activity": 0.15,
-    "fund_flow": 0.15,
-    "sector_momentum": 0.15,
-    "relative_strength": 0.10,
-    "trend": 0.10,
+    "strength": 0.18,
+    "activity": 0.12,
+    "fund_flow": 0.12,
+    "sector_momentum": 0.12,
+    "relative_strength": 0.08,
+    "trend": 0.08,
+    "limit_up_gene": 0.10,
     "valuation": 0.08,
     "market_cap": 0.07,
+    "leader_bonus": 0.05,
 }
 
 
@@ -77,6 +79,10 @@ class StockRecommendation:
     sector_momentum_5d: float = 0
 
     is_limit_up: bool = False
+    is_sector_leader: bool = False
+    limit_up_5d: int = 0
+    limit_up_20d: int = 0
+    position_pct: float = 0
     action: str = ""
     entry_range: str = ""
     stop_loss: str = ""
@@ -203,6 +209,31 @@ def _score_market_cap(total_mv: float) -> float:
         return max(10, 40 - (mv_yi - 2000) / 5000 * 30)
 
 
+def _score_limit_up_gene(lu_5d: int, lu_20d: int) -> float:
+    """Limit-up gene score 0-100"""
+    if lu_5d == 0 and lu_20d == 0:
+        return 30
+    score_5d = min(lu_5d * 25, 60)
+    score_20d = min(lu_20d * 8, 40)
+    total = score_5d + score_20d
+    if lu_5d >= 4:
+        total = max(40, total - 15)
+    return min(100, total)
+
+
+def _score_leader_bonus(is_leader: bool, sector_rank: int) -> float:
+    """Sector leader bonus 0-100"""
+    if not is_leader:
+        return 0
+    if sector_rank == 1:
+        return 100
+    elif sector_rank == 2:
+        return 85
+    elif sector_rank == 3:
+        return 70
+    return 0
+
+
 def _generate_action(chg: float, turnover: float, vol_ratio: float, composite: float, sector_mom: float) -> tuple[str, str, str]:
     """Generate buy action, entry range, stop loss"""
     if chg >= 9.8:
@@ -250,6 +281,15 @@ class StockRecommender:
         self._sector_momentum: dict[str, dict] = {}
         self._names: dict[str, str] = {}
         self._loaded = False
+        self._tdx_data_dir = self._find_tdx_data_dir()
+        self._limit_up_cache: dict[str, tuple[int, int]] = {}
+
+    def _find_tdx_data_dir(self) -> str:
+        candidates = [r"D:\new_tdx_test", r"D:\new_tdx", r"C:\new_tdx", r"D:\tdx"]
+        for c in candidates:
+            if os.path.isdir(os.path.join(c, "vipdoc")):
+                return c
+        return ""
 
     def load_data(self) -> None:
         if self._loaded:
@@ -260,10 +300,10 @@ class StockRecommender:
 
         self._mapper = TdxSectorMapper()
         self._mapper.load_infoharbor()
-        try:
-            self._mapper.load_industry()
-        except Exception:
-            pass
+
+        from dragon_eye.analysis.tdx_industry import TdxIndustryReader
+        self._ind_reader = TdxIndustryReader()
+        self._ind_reader._ensure_loaded()
 
         self._tdx_sectors = TdxSectorReader()
         self._tdx_sectors.load_sector_map()
@@ -286,112 +326,187 @@ class StockRecommender:
                 return json.load(f)
         return {}
 
-    def recommend(self, top_n: int = 20, min_score: float = 40) -> list[StockRecommendation]:
-        """Run multi-factor scoring, return ranked recommendations"""
+    def _day_file_path(self, code: str) -> str:
+        if not self._tdx_data_dir:
+            return ""
+        code = code.strip()
+        market = "sh" if (code.startswith("6") or code.startswith("9")) else "sz"
+        return os.path.join(self._tdx_data_dir, "vipdoc", market, "lday", f"{market}{code}.day")
+
+    def _read_day_changes(self, code: str, max_bars: int = 30) -> list[float]:
+        """Read recent daily change% from TDX .day file"""
+        path = self._day_file_path(code)
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            import struct
+            rec_size = 32
+            total = len(data) // rec_size
+            if total < 2:
+                return []
+            start = max(0, total - max_bars - 1)
+            changes = []
+            prev = None
+            for i in range(start, total):
+                off = i * rec_size
+                if off + 28 > len(data):
+                    break
+                close = struct.unpack_from('<f', data, off + 16)[0]
+                if prev and prev > 0:
+                    changes.append((close - prev) / prev * 100)
+                prev = close
+            return changes
+        except Exception:
+            return []
+
+    def _count_limit_ups(self, code: str) -> tuple[int, int]:
+        if code in self._limit_up_cache:
+            return self._limit_up_cache[code]
+        changes = self._read_day_changes(code, 25)
+        if not changes:
+            self._limit_up_cache[code] = (0, 0)
+            return (0, 0)
+        lu_5d = sum(1 for c in changes[-5:] if c >= 9.8)
+        lu_20d = sum(1 for c in changes[-20:] if c >= 9.8)
+        self._limit_up_cache[code] = (lu_5d, lu_20d)
+        return (lu_5d, lu_20d)
+
+    def recommend(self, top_n: int = 20, min_score: float = 40, max_per_sector: int = 3) -> list[StockRecommendation]:
+        """Two-pass multi-factor scoring with correlation filter and position sizing."""
         if not self._loaded:
             self.load_data()
 
-        results: list[StockRecommendation] = []
-        all_stats = self._stats._stats
-
-        for code, stat in all_stats.items():
-            stat2 = self._stats.get_stat2(code)
-
+        # === PASS 1: Fast scoring (all stocks, no .day read) ===
+        candidates: list[dict] = []
+        
+        for code, stat in self._stats._stats.items():
             if stat.turnover <= 0 and stat.change_pct == 0:
                 continue
-
-            name = self._names.get(code, code)
-            industry = self._mapper.get_industry(code) or ""
-            sector_mom_data = self._sector_momentum.get(industry, {})
-            sector_mom_3d = sector_mom_data.get('momentum_3d', 0)
-            sector_mom_5d = sector_mom_data.get('momentum_5d', 0)
-            sector_chg = sector_mom_data.get('change_pct', 0)
-
+            
+            stat2 = self._stats.get_stat2(code)
             flow_pct_val = stat2.flow_pct if stat2 else 0
-            flow_net_val = stat2.flow_net if stat2 else 0
+            industry = self._ind_reader.get_industry(code) or ""
+            mom_data = self._sector_momentum.get(industry, {})
+            s_mom_3d = mom_data.get('momentum_3d', 0)
+            s_mom_5d = mom_data.get('momentum_5d', 0)
+            s_chg = mom_data.get('change_pct', 0)
 
-            # Calculate factor scores
-            s_strength = _score_strength(stat.change_pct)
-            s_activity = _score_activity(stat.turnover, stat.volume_ratio)
-            s_fund_flow = _score_fund_flow(flow_pct_val)
-            s_sector = _score_sector_momentum(sector_mom_3d, sector_mom_5d)
-            s_relative = _score_relative(stat.change_pct, sector_chg)
-            s_trend = _score_trend(stat.chg_20d, stat.chg_60d)
-            s_valuation = _score_valuation(stat.pe)
-            s_market_cap = _score_market_cap(stat.total_mv)
+            s0 = _score_strength(stat.change_pct)
+            s1 = _score_activity(stat.turnover, stat.volume_ratio)
+            s2 = _score_fund_flow(flow_pct_val)
+            s3 = _score_sector_momentum(s_mom_3d, s_mom_5d)
+            s4 = _score_relative(stat.change_pct, s_chg)
+            s5 = _score_trend(stat.chg_20d, stat.chg_60d)
+            s6 = _score_valuation(stat.pe)
+            s7 = _score_market_cap(stat.total_mv)
 
-            # Weighted composite
-            composite = (
-                s_strength * FACTOR_WEIGHTS["strength"] +
-                s_activity * FACTOR_WEIGHTS["activity"] +
-                s_fund_flow * FACTOR_WEIGHTS["fund_flow"] +
-                s_sector * FACTOR_WEIGHTS["sector_momentum"] +
-                s_relative * FACTOR_WEIGHTS["relative_strength"] +
-                s_trend * FACTOR_WEIGHTS["trend"] +
-                s_valuation * FACTOR_WEIGHTS["valuation"] +
-                s_market_cap * FACTOR_WEIGHTS["market_cap"]
-            )
+            fast = (s0 * 0.28 + s1 * FACTOR_WEIGHTS["activity"] +
+                    s2 * FACTOR_WEIGHTS["fund_flow"] + s3 * FACTOR_WEIGHTS["sector_momentum"] +
+                    s4 * FACTOR_WEIGHTS["relative_strength"] + s5 * FACTOR_WEIGHTS["trend"] +
+                    s6 * FACTOR_WEIGHTS["valuation"] + s7 * FACTOR_WEIGHTS["market_cap"])
+            
+            if fast < 25:
+                continue
+
+            candidates.append({"code": code, "stat": stat, "stat2": stat2, "industry": industry,
+                              "s0": s0, "s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5,
+                              "s6": s6, "s7": s7, "fast": fast, "s_mom_3d": s_mom_3d,
+                              "s_mom_5d": s_mom_5d, "s_chg": s_chg, "flow_pct": flow_pct_val})
+
+        candidates.sort(key=lambda x: -x["fast"])
+        top200 = candidates[:200]
+
+        # Leader detection
+        sector_rankings: dict[str, list[str]] = {}
+        for c in sorted(top200, key=lambda x: -x["fast"]):
+            ind = c["industry"]
+            if not ind:
+                continue
+            if ind not in sector_rankings:
+                sector_rankings[ind] = []
+            sector_rankings[ind].append(c["code"])
+        leader_map: dict[str, int] = {}
+        for ind, codes in sector_rankings.items():
+            for rank, code in enumerate(codes[:10], 1):
+                leader_map[code] = rank
+
+        # === PASS 2: Deep scoring (top 200, read .day history) ===
+        results: list[StockRecommendation] = []
+        name_map = self._names
+
+        for c in top200:
+            code = c["code"]
+            stat = c["stat"]
+            stat2 = c["stat2"]
+            industry = c["industry"]
+            name = name_map.get(code, code)
+
+            lu_5d, lu_20d = self._count_limit_ups(code)
+            s_lu = _score_limit_up_gene(lu_5d, lu_20d)
+            sr = leader_map.get(code, 999)
+            is_leader = sr <= 3
+            s_ld = _score_leader_bonus(is_leader, sr)
+
+            composite = (c["s0"] * FACTOR_WEIGHTS["strength"] + c["s1"] * FACTOR_WEIGHTS["activity"] +
+                         c["s2"] * FACTOR_WEIGHTS["fund_flow"] + c["s3"] * FACTOR_WEIGHTS["sector_momentum"] +
+                         c["s4"] * FACTOR_WEIGHTS["relative_strength"] + c["s5"] * FACTOR_WEIGHTS["trend"] +
+                         s_lu * FACTOR_WEIGHTS["limit_up_gene"] + c["s6"] * FACTOR_WEIGHTS["valuation"] +
+                         c["s7"] * FACTOR_WEIGHTS["market_cap"] + s_ld * FACTOR_WEIGHTS["leader_bonus"])
 
             if composite < min_score:
                 continue
 
             grade = _grade(composite)
-
-            # Generate action
-            sector_mom_combo = sector_mom_3d * 0.6 + sector_mom_5d * 0.4
+            sm_combo = c["s_mom_3d"] * 0.6 + c["s_mom_5d"] * 0.4
             action, entry_range, stop_loss = _generate_action(
-                stat.change_pct, stat.turnover, stat.volume_ratio,
-                composite, sector_mom_combo
-            )
+                stat.change_pct, stat.turnover, stat.volume_ratio, composite, sm_combo)
 
-            # Build reasons
+            # Position sizing
+            pos = 15 if grade == "S" else (10 if grade == "A" else (5 if grade == "B" else 3))
+            if stat.change_pct >= 9.8:
+                pos *= 0.7
+
+            # Reasons
             reasons = []
-            if s_strength >= 80:
-                reasons.append(f"涨幅强劲(+{stat.change_pct:.1f}%)")
-            if s_activity >= 70:
-                reasons.append(f"交投活跃(换手{stat.turnover:.1f}% 量比{stat.volume_ratio:.1f})")
-            if s_fund_flow >= 70:
-                reasons.append(f"主力净流入占比{flow_pct_val:.1f}%")
-            if s_sector >= 70:
-                reasons.append(f"板块强势(3日{sector_mom_3d:+.1f}%)")
-            if s_relative >= 65:
-                reasons.append(f"领跑板块(超额{stat.change_pct - sector_chg:+.1f}%)")
+            if c["s0"] >= 80: reasons.append(f"涨幅强劲(+{stat.change_pct:.1f}%)")
+            if c["s1"] >= 70: reasons.append(f"交投活跃(换手{stat.turnover:.1f}% 量比{stat.volume_ratio:.1f})")
+            if c["s2"] >= 70: reasons.append(f"主力净流入占比{c['flow_pct']:.1f}%")
+            if c["s3"] >= 70: reasons.append(f"板块强势(3日{c['s_mom_3d']:+.1f}%)")
+            if s_lu >= 60: reasons.append(f"涨停基因(5日{lu_5d}板/20日{lu_20d}板)")
+            if is_leader: reasons.append(f"行业龙头(#{sr})")
 
             mv_yi = stat.total_mv / 10000 if stat.total_mv > 0 else 0
             results.append(StockRecommendation(
-                code=code,
-                name=name,
-                composite=round(composite, 1),
-                grade=grade,
-                score_strength=round(s_strength, 1),
-                score_activity=round(s_activity, 1),
-                score_fund_flow=round(s_fund_flow, 1),
-                score_sector_momentum=round(s_sector, 1),
-                score_relative=round(s_relative, 1),
-                score_trend=round(s_trend, 1),
-                score_valuation=round(s_valuation, 1),
-                score_market_cap=round(s_market_cap, 1),
-                change_pct=stat.change_pct,
-                turnover=stat.turnover,
-                volume_ratio=stat.volume_ratio,
-                net_flow_yi=round(flow_net_val / 10000, 2),
-                flow_pct=round(flow_pct_val, 2),
-                pe=stat.pe,
-                mv_yi=round(mv_yi, 1),
-                chg_20d=stat.chg_20d,
-                chg_60d=stat.chg_60d,
-                sector=industry,
-                sector_momentum_3d=round(sector_mom_3d, 2),
-                sector_momentum_5d=round(sector_mom_5d, 2),
-                is_limit_up=stat.change_pct >= 9.8,
-                action=action,
-                entry_range=entry_range,
-                stop_loss=stop_loss,
-                reasons=reasons,
-            ))
+                code=code, name=name, composite=round(composite, 1), grade=grade,
+                score_strength=round(c["s0"], 1), score_activity=round(c["s1"], 1),
+                score_fund_flow=round(c["s2"], 1), score_sector_momentum=round(c["s3"], 1),
+                score_relative=round(c["s4"], 1), score_trend=round(c["s5"], 1),
+                score_valuation=round(c["s6"], 1), score_market_cap=round(c["s7"], 1),
+                change_pct=stat.change_pct, turnover=stat.turnover, volume_ratio=stat.volume_ratio,
+                net_flow_yi=round((stat2.flow_net / 10000) if stat2 else 0, 2),
+                flow_pct=round(c["flow_pct"], 2), pe=stat.pe, mv_yi=round(mv_yi, 1),
+                chg_20d=stat.chg_20d, chg_60d=stat.chg_60d, sector=industry,
+                sector_momentum_3d=round(c["s_mom_3d"], 2), sector_momentum_5d=round(c["s_mom_5d"], 2),
+                is_limit_up=stat.change_pct >= 9.8, is_sector_leader=is_leader,
+                limit_up_5d=lu_5d, limit_up_20d=lu_20d, position_pct=round(pos, 1),
+                action=action, entry_range=entry_range, stop_loss=stop_loss, reasons=reasons))
 
         results.sort(key=lambda x: (-x.composite, -x.change_pct))
-        return results[:top_n]
+
+        # === Correlation filter (max per sector) ===
+        filtered: list[StockRecommendation] = []
+        sector_counts: dict[str, int] = {}
+        for r in results:
+            sec = r.sector
+            if sector_counts.get(sec, 0) >= max_per_sector and sec:
+                continue
+            filtered.append(r)
+            if sec:
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+        return filtered[:top_n]
 
     def recommend_by_sector(self, sector_name: str, top_n: int = 5) -> list[StockRecommendation]:
         all_recs = self.recommend(top_n=9999, min_score=0)

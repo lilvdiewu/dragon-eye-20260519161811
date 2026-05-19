@@ -764,22 +764,24 @@ def _render_strategy_section(results: dict):
     from dragon_eye.analysis.stock_recommender import get_recommender
     
     recommender = get_recommender()
-    recs = recommender.recommend(top_n=15, min_score=50)
+    recs = recommender.recommend(top_n=15, min_score=50, max_per_sector=3)
     
     if recs:
         rows = []
         for r in recs:
+            leader_mark = "👑" if r.is_sector_leader else ""
             rows.append({
                 "代码": r.code,
-                "名称": r.name,
+                "名称": f"{leader_mark}{r.name}",
                 "评分": f"{r.composite:.0f}",
                 "等级": r.grade,
                 "涨幅": f"{r.change_pct:+.1f}%",
                 "换手": f"{r.turnover:.1f}%",
                 "量比": f"{r.volume_ratio:.1f}",
                 "流入%": f"{r.flow_pct:.1f}%",
+                "涨停基因": f"{r.limit_up_5d}/{r.limit_up_20d}",
                 "板块": r.sector[:8],
-                "板块动量": f"3d{r.sector_momentum_3d:+.0f}%",
+                "仓位%": f"{r.position_pct:.0f}%",
                 "操作": r.action,
             })
         
