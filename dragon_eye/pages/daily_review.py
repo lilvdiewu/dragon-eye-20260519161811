@@ -315,14 +315,16 @@ def _assess_market_overview() -> dict:
             flat_count += 1
         elif stat.change_pct > 0:
             up_count += 1
-            if stat.change_pct >= 9.8:  # 涨停（含创业板20%）
+            if stat.change_pct >= 9.8:
                 limit_up += 1
         else:
             down_count += 1
             if stat.change_pct <= -9.8:
                 limit_down += 1
 
-        total_amount += stat.amount  # stat.amount is in 元, from tdxstat.cfg field[22]
+        # 成交额估算: amount_est = 流通市值 × |换手率| / 100 (单位:万元)
+        # field[22] 不是成交额，用 amount_est 替代
+        total_amount += stat.amount_est
         valid += 1
 
     total = up_count + down_count + flat_count
@@ -454,8 +456,8 @@ def _render_review_report(results: dict):
         with col5:
             st.metric("涨跌比", f"{overview.get('up_ratio', 0):.0%}")
         with col6:
-            total_yi = overview.get('total_amount', 0) / 1e8  # 元→亿
-            st.metric("成交额", f"{total_yi:.0f}亿")
+            total_yi = overview.get('total_amount', 0) / 10000  # 万元→亿
+            st.metric("成交额(估)", f"{total_yi:.0f}亿")
 
         mood = overview.get("mood", "")
         st.info(f"**市场情绪**: {mood}")
@@ -584,47 +586,7 @@ def _render_review_report(results: dict):
         st.divider()
 
     # === 六、明日操作思路 ===
-    st.markdown("## 📝 六、明日操作思路")
-
-    overview = results.get("market_overview", {})
-    limit_up = overview.get("limit_up", 0)
-
-    # 主线前三
-    top3 = themes[:3] if themes else []
-    if limit_up >= 100:
-        st.warning(
-            f"**节奏**：涨停{limit_up}只，市场处于高潮期。\n\n"
-            f"**主线**：{' → '.join([t['name'] for t in top3])}\n\n"
-            f"**策略**：不追缩量一字板。关注今日封板但放量的龙头，明早竞价确认强度后介入。"
-            f"如果竞价高开8%以上直接放弃，等盘中回踩。"
-        )
-    elif limit_up >= 50:
-        st.info(
-            f"**节奏**：涨停{limit_up}只，做多窗口。\n\n"
-            f"**主线**：{' → '.join([t['name'] for t in top3])}\n\n"
-            f"**策略**：龙头股明天如果有2%以内的开盘，可以直接上。"
-            f"重点盯前三个板块的领涨龙头（见上方龙头分析表）。"
-        )
-    else:
-        st.warning(
-            f"**节奏**：涨停仅{limit_up}只，市场偏冷。\n\n"
-            f"**策略**：不开新仓。关注逆势抗跌的票（今日微涨或平盘的行业龙头），"
-            f"等情绪修复后第一时间切入。"
-        )
-
-    # 候选池
-    dragon_heads = results.get("dragon_heads", {})
-    if dragon_heads:
-        candidates = []
-        for theme_name, heads in dragon_heads.items():
-            for h in heads[:2]:
-                if abs(h["chg_today"]) < 9.5 and h["composite"] > 0:
-                    candidates.append(f"{h['name']}({h['code']}) · {theme_name} · 分{h['composite']:.0f}")
-
-        if candidates:
-            st.success("**明日候选池（未涨停 + 高分）**:\n\n" + "\n".join(f"• {c}" for c in candidates[:8]))
-
-    st.caption("⚠️ 以上为数据参考，最终决策请结合盘感和纪律。")
+    _render_strategy_section(results)
 
     # 导出
     st.divider()
@@ -635,6 +597,100 @@ def _render_review_report(results: dict):
         file_name=f"review_{_get_today_date()}.csv",
         mime="text/csv",
     )
+
+
+# ============================================================
+# 策略渲染（数据驱动，拒绝笼统）
+# ============================================================
+
+def _render_strategy_section(results: dict):
+    """生成具体的明日操作策略，每个结论都有数字支撑"""
+    st.markdown("## 📝 六、明日操作思路")
+    overview = results.get("market_overview", {})
+    themes = results.get("main_themes", [])
+    dragon_heads = results.get("dragon_heads", {})
+    fund_flow = results.get("fund_flow", {})
+
+    limit_up = overview.get("limit_up", 0)
+    limit_down = overview.get("limit_down", 0)
+    up_ratio = overview.get("up_ratio", 0)
+    total_yi = overview.get("total_amount", 0) / 10000
+
+    # 1. 节奏判断
+    st.markdown("### 🎯 节奏判断")
+    rhythm = f"涨停**{limit_up}**只 / 跌停**{limit_down}**只 / 涨跌比 **{up_ratio:.0%}** / 成交约 **{total_yi:.0f}亿**"
+
+    if limit_up >= 100 and up_ratio >= 0.6:
+        st.warning(f"🔥 **高潮期** | {rhythm}")
+        st.markdown("- ⚠️ 次日分歧概率高（历史上高潮次日成功率仅~40%）\n- 🚫 不追缩量一字板\n- ✅ 标的：今日放量封板+换手>5%+尾盘未炸板\n- 📊 买点：竞价高开<3%试仓，>5%等回踩")
+    elif limit_up >= 50 and up_ratio >= 0.5:
+        st.success(f"🟢 **做多窗口** | {rhythm}")
+        st.markdown("- ✅ 仓位：5-7成\n- 📊 买点：龙头开0-3%介入，止损=今日最低-0.5%")
+    elif up_ratio >= 0.4:
+        st.info(f"🟡 **轮动格局** | {rhythm}")
+        st.markdown("- 📌 仓位：3-5成，只做最强1-2板块\n- ⚡ 策略：买龙头不买杂毛，不追轮动")
+    elif limit_down >= 30:
+        st.error(f"🔴 **亏钱效应** | {rhythm}")
+        st.markdown("- 🛑 仓位≤2成或空仓\n- 👀 关注逆势抗跌票（20日线上+缩量）")
+    else:
+        st.error(f"🧊 **冰点** | {rhythm}")
+        st.markdown("- 🌡️ 仓位：1成试错或空仓\n- 🔍 止损-3%无条件走")
+
+    # 2. 主线方向
+    st.markdown("### 🧭 明日主线方向")
+    top3 = themes[:3] if themes else []
+    for i, t in enumerate(top3):
+        b = "🟢" if t.get("breadth", 0) >= 0.6 else ("🟡" if t.get("breadth", 0) >= 0.4 else "🔴")
+        st.markdown(f"{i+1}. **{t['name']}** {b} {t.get('up_count',0)}↑/{t.get('down_count',0)}↓ (强度{t['score']:.0f}) · 龙头:{t.get('leader_name','?')} {t.get('leader_chg',0):+.2f}%")
+    if len(top3) >= 2:
+        gap = top3[0]["score"] - top3[1]["score"]
+        st.caption(f"💪 {top3[0]['name']}领先{gap:.0f}分" if gap > 20 else f"⚖️ 差距仅{gap:.0f}分，明天可能轮动")
+
+    # 3. 候选池
+    st.markdown("### 🎫 明日候选池")
+    candidates = []
+    theme_order = {t["name"]: i for i, t in enumerate(themes) if t} if themes else {}
+    for theme_name, heads in dragon_heads.items():
+        rank = theme_order.get(theme_name, 99)
+        for h in heads:
+            if h["composite"] > 0:
+                chg = h["chg_today"]
+                if chg >= 9.5: action = "涨停→竞价看强度"
+                elif chg >= 5: action = "强势→开0-2%可入"
+                elif chg >= 0: action = "温和→开0-1%可入"
+                else: action = "抗跌→翻红确认再入"
+                candidates.append({"code": h["code"], "name": h["name"], "theme": theme_name[:8],
+                                   "chg": f"{chg:+.1f}%", "score": f"{h['composite']:.1f}",
+                                   "turn": f"{h.get('turnover',0):.1f}%", "action": action,
+                                   "rank": rank, "is_limit": chg >= 9.5})
+    candidates.sort(key=lambda c: (c["is_limit"], -float(c["score"]), c["rank"]))
+    
+    if candidates:
+        st.dataframe([{k: v for k, v in c.items() if k not in ("rank", "is_limit")} 
+                       for c in candidates[:10]], use_container_width=True, hide_index=True, height=380)
+        st.info("📋 **盘前检查**: 1.竞价低开>-3%的删 2.前10分钟不动手 3.单票≤15%仓位 4.龙头高开>5%不追 5.大盘开跌>1%不新开仓")
+    else:
+        st.caption("暂无明显候选")
+
+    # 4. 资金验证
+    sector_flows = fund_flow.get("sector_flow_rank", [])
+    if sector_flows:
+        theme_names = [t["name"] for t in themes[:8]] if themes else []
+        matched = [sf for sf in sector_flows if sf["sector"] in theme_names]
+        st.markdown("### 💰 资金验证")
+        if matched:
+            st.success(f"✅ 主力与主线一致：{'、'.join(f['sector'] for f in matched[:3])}")
+        else:
+            st.warning(f"⚠️ 主力净流入第一【{sector_flows[0]['sector']}】({sector_flows[0]['flow_yi']:+.1f}亿)不在前8主线，注意切换")
+
+    # 5. 风险
+    st.markdown("### ⚠️ 风险因子")
+    risks = []
+    if limit_up >= 150: risks.append(f"涨停{limit_up}只→高潮极致，明天大概率分化")
+    if limit_down >= 20: risks.append(f"跌停{limit_down}只→亏钱效应扩散")
+    if up_ratio < 0.35: risks.append(f"涨跌比仅{up_ratio:.0%}→信心不足")
+    if total_yi < 8000: risks.append(f"成交仅{total_yi:.0f}亿→流动性不足")
+    st.markdown("\n".join(f"• {r}" for r in risks) if risks else "• 未检测到明显风险")
 
 
 # ============================================================
