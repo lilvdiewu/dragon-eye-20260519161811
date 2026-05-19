@@ -1,0 +1,23 @@
+# 龙瞳Pro统一配置
+push:
+  pushplus_token: "a84ae607d0f64a8580f223fb17526e33"
+  pushplus_enabled: true
+  min_level: "medium"          # high/medium/low，低于此级别不推送
+  dedup_hours: 4               # 同一只股票N小时内不重复推送
+  toast_enabled: true           # 是否启用Windows Toast通知
+
+scheduler:
+  enabled: true
+  scan_time: "15:30"            # 每日收盘后扫描时间
+  summary_time: "16:00"         # 每日汇总推送时间
+  strategies:                   # 扫描哪些策略
+    - bottom_breakout
+    - pullback_buy
+  min_strength: 50              # 最低信号强度
+  watchlist: []                 # 自选股代码列表（空=全市场）
+
+proxy:
+  http: "http://127.0.0.1:7897"
+  https: "http://127.0.0.1:7897"
+  no_proxy:                     # 不走代理的域名
+    - pushplus.plus
