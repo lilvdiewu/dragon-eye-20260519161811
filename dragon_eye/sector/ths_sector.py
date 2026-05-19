@@ -766,7 +766,7 @@ class ThsSectorFetcher:
         results = []
 
         try:
-            df = self._ak_with_timeout(lambda: ak.stock_board_concept_summary_ths(), timeout=15)
+            df = self._ak_with_timeout(lambda: ak.stock_board_concept_summary_ths(), timeout=30)
             if df is None or df.empty:
                 return results
 

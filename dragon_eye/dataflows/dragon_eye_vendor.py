@@ -430,47 +430,76 @@ def get_news_dragon_eye(
     ind_reader = _get_industry_reader()
     industry = ind_reader.get_industry(code6)
 
+    # 获取股票简称（用于新闻关键词过滤）
+    stock_name = ""
+    try:
+        from dragon_eye.akshare_bridge import get_bridge
+        bridge = get_bridge()
+        name_map = bridge.enrich_stock_names([code6])
+        stock_name = name_map.get(code6, "")
+    except Exception:
+        pass
+
+    # 构建关键词列表（股票名+代码+行业）
+    keywords = [code6]
+    if stock_name:
+        # 取前N个字做关键词（处理"贵州茅台"→"茅台"这种情况）
+        keywords.append(stock_name)
+        if len(stock_name) >= 3:
+            keywords.append(stock_name[-2:])  # 后两字
+        if len(stock_name) >= 4:
+            keywords.append(stock_name[-3:])  # 后三字
+    if industry:
+        keywords.append(industry)
+
     news_str = ""
     article_count = 0
 
-    # ── 0. 东方财富个股新闻（最优先，能抓到调研/公告）──
+    # ── 0. 东方财富个股新闻（通过搜索API抓取）──
     try:
         import requests as _req
         _sess = _req.Session()
         _sess.trust_env = False
-        stock_news_url = "https://np-listapi.eastmoney.com/comm/web/getNewsByCode"
-        stock_params = {
-            "client": "web",
-            "biz": "web_news_stock",
-            "code": code6,
-            "order": "1",
-            "page_index": "1",
-            "page_size": "15",
-            "fields": "title,showTime,mediaName,srcUrl,content,digest",
+        _sess.headers['User-Agent'] = 'Mozilla/5.0'
+        _sess.headers['Referer'] = 'https://guba.eastmoney.com/'
+
+        # 使用东方财富F10公司新闻接口
+        f10_url = "https://emweb.securities.eastmoney.com/PC_HSF10/CompanyNews/CompanyNewsAjax"
+        f10_params = {
+            "code": f"{'SH' if code6.startswith('6') else 'SZ'}{code6}",
+            "pageSize": "10",
+            "pageIndex": "1",
+            "type": "0",
         }
-        resp = _sess.get(stock_news_url, params=stock_params, timeout=10)
+        resp = _sess.get(f10_url, params=f10_params, timeout=10)
         if resp.status_code == 200:
-            data = resp.json()
-            stock_articles = data.get("data", {}).get("list", [])
-            if stock_articles:
-                news_str += "## Stock-Specific News (Eastmoney)\n\n"
-                for a in stock_articles[:12]:
-                    title = a.get("title", "")
-                    media = a.get("mediaName", "")
-                    show_time = a.get("showTime", "")
-                    digest = (a.get("digest", "") or a.get("content", ""))
-                    if digest and len(digest) > 300:
-                        digest = digest[:300] + "..."
-                    link = a.get("srcUrl", "")
-                    news_str += f"### {title} (source: {media})\n"
-                    if show_time:
-                        news_str += f"Time: {show_time}\n"
-                    if digest:
-                        news_str += f"{digest}\n"
-                    if link:
-                        news_str += f"Link: {link}\n"
-                    news_str += "\n"
-                    article_count += 1
+            resp.encoding = 'utf-8'
+            raw = resp.text
+            # 尝试提取JSON中的数据（页面可能是JS生成，直接找JSON）
+            import re as _re
+            # 尝试匹配JSON数组
+            json_match = _re.search(r'\{[^{}]*"data"[^{}]*\[[^\]]*\][^{}]*\}', raw)
+            if json_match:
+                try:
+                    import json as _json
+                    data = _json.loads(json_match.group())
+                    items = data.get("data", [])
+                    if items:
+                        news_str += "## 📰 Stock-Specific News (F10 Company News)\n\n"
+                        for item in items[:10]:
+                            title = item.get("TITLE", item.get("title", ""))
+                            date = item.get("PUBLISHDATE", item.get("NOTICEDATE", ""))
+                            link = item.get("URL", item.get("INFOCODE", ""))
+                            if title:
+                                news_str += f"### {title}\n"
+                                if date:
+                                    news_str += f"Date: {date}\n"
+                                if link and link.startswith("http"):
+                                    news_str += f"Link: {link}\n"
+                                news_str += "\n"
+                                article_count += 1
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -497,24 +526,36 @@ def get_news_dragon_eye(
         articles = data.get("data", {}).get("list", [])
 
         if articles:
-            for a in articles[:15]:
-                title = a.get("title", "No title")
+            # 标记：是否有相关个股新闻（如果已有F10新闻，这里只补充行业相关的）
+            news_str += "## 📡 Market News (keyword-filtered)\n\n"
+            general_count = 0
+            for a in articles[:20]:
+                title = a.get("title", "")
                 media = a.get("mediaName", "Unknown")
                 show_time = a.get("showTime", "")
-                digest = a.get("digest", "") or a.get("content", "")
+                digest = (a.get("digest", "") or a.get("content", ""))
                 if digest and len(digest) > 200:
                     digest = digest[:200] + "..."
                 link = a.get("srcUrl", "")
 
-                news_str += f"### {title} (source: {media})\n"
-                if show_time:
-                    news_str += f"Time: {show_time}\n"
-                if digest:
-                    news_str += f"{digest}\n"
-                if link:
-                    news_str += f"Link: {link}\n"
-                news_str += "\n"
-                article_count += 1
+                # 关键词过滤：标题或摘要中包含个股/行业关键词
+                text_to_check = title + " " + (digest or "")
+                matched = any(kw in text_to_check for kw in keywords)
+                if not matched and general_count < 5:
+                    # 即使不匹配，也保留前5条作为市场背景
+                    matched = True
+
+                if matched:
+                    general_count += 1
+                    news_str += f"### {title} (source: {media})\n"
+                    if show_time:
+                        news_str += f"Time: {show_time}\n"
+                    if digest:
+                        news_str += f"{digest}\n"
+                    if link:
+                        news_str += f"Link: {link}\n"
+                    news_str += "\n"
+                    article_count += 1
     except Exception:
         pass  # 东方财富不可用时静默跳过
 

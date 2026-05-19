@@ -59,8 +59,10 @@ def _cached_concept_sectors() -> list:
         except Exception:
             pass
 
-    # 在线获取
-    sectors = fetcher.get_concept_list()
+    # 在线获取 — 优先用concept_summary（有涨跌幅+资金流向），回落用concept_list（快但只有名字）
+    sectors = fetcher.get_concept_summary()
+    if not sectors:
+        sectors = fetcher.get_concept_list()
     if sectors:
         sectors = ranker.rank(sectors)
 
