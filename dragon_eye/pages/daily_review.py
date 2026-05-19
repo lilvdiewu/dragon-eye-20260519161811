@@ -99,7 +99,10 @@ def _run_deep_review() -> dict:
     # 4. 资金流向
     results["fund_flow"] = _analyze_fund_flow()
 
-    # 5. 板块联动
+    # 5. 涨停板深度分析
+    results["limit_up_analysis"] = _analyze_limit_up()
+
+    # 6. 板块联动
     results["sector_linkage"] = _analyze_sector_linkage(results["main_themes"])
 
     return results
@@ -361,6 +364,77 @@ def _assess_market_overview() -> dict:
     }
 
 
+def _analyze_limit_up() -> dict:
+    """
+    涨停板深度分析：
+    - 涨停股行业/概念分布
+    - 换手率特征（缩量板 vs 放量板）
+    - PE/市值特征
+    """
+    stats = _get_stat_reader()
+    mapper = _get_sector_mapper()
+    names = _get_stock_names()
+
+    limit_up_stocks = []
+    for code, stat in stats._stats.items():
+        if stat.change_pct >= 9.8:
+            name = names.get(code, code)
+            industry = mapper.get_industry(code)
+            limit_up_stocks.append({
+                "code": code,
+                "name": name,
+                "chg": stat.change_pct,
+                "turnover": stat.turnover,
+                "volume_ratio": stat.volume_ratio,
+                "pe": stat.pe,
+                "mv_yi": stat.total_mv / 10000 if stat.total_mv > 0 else 0,
+                "industry": industry or "未分类",
+            })
+
+    if not limit_up_stocks:
+        return {"total": 0, "by_industry": {}, "features": {}}
+
+    # 行业分布
+    industry_dist: dict[str, int] = {}
+    for s in limit_up_stocks:
+        ind = s["industry"]
+        industry_dist[ind] = industry_dist.get(ind, 0) + 1
+    top_industries = sorted(industry_dist.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    # 换手率特征
+    turnovers = [s["turnover"] for s in limit_up_stocks if s["turnover"] > 0]
+    avg_turnover = sum(turnovers) / len(turnovers) if turnovers else 0
+    low_turn = sum(1 for t in turnovers if t < 3)  # 缩量板(<3%)
+    mid_turn = sum(1 for t in turnovers if 3 <= t < 10)  # 适中
+    high_turn = sum(1 for t in turnovers if t >= 10)  # 放量板(>=10%)
+
+    # PE分布
+    pes = [s["pe"] for s in limit_up_stocks if 0 < s["pe"] < 1000]
+    avg_pe = sum(pes) / len(pes) if pes else 0
+
+    # 市值分布
+    mvs = [s["mv_yi"] for s in limit_up_stocks if s["mv_yi"] > 0]
+    small_cap = sum(1 for m in mvs if m < 50)   # <50亿
+    mid_cap = sum(1 for m in mvs if 50 <= m < 200)
+    large_cap = sum(1 for m in mvs if m >= 200)
+
+    return {
+        "total": len(limit_up_stocks),
+        "stocks": limit_up_stocks,
+        "by_industry": top_industries,
+        "features": {
+            "avg_turnover": avg_turnover,
+            "low_turn_count": low_turn,
+            "mid_turn_count": mid_turn,
+            "high_turn_count": high_turn,
+            "avg_pe": avg_pe,
+            "small_cap_count": small_cap,
+            "mid_cap_count": mid_cap,
+            "large_cap_count": large_cap,
+        },
+    }
+
+
 def _analyze_fund_flow() -> dict:
     """
     资金流向：主力净流入TOP + 行业分布
@@ -569,6 +643,44 @@ def _render_review_report(results: dict):
                 ])
                 fig.update_layout(height=350, margin=dict(l=20, r=20, t=10, b=20))
                 st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+    # === 四-半、涨停板深度分析 ===
+    lu = results.get("limit_up_analysis", {})
+    if lu and lu.get("total", 0) > 0:
+        st.markdown("## 🔥 涨停板深度分析")
+        
+        total_lu = lu["total"]
+        feats = lu.get("features", {})
+        
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("涨停总数", f"{total_lu} 只")
+            st.metric("均换手率", f"{feats.get('avg_turnover', 0):.1f}%")
+        with c2:
+            st.metric("缩量板(<3%)", f"{feats.get('low_turn_count', 0)} 只")
+            st.metric("放量板(>=10%)", f"{feats.get('high_turn_count', 0)} 只")
+        with c3:
+            st.metric("均PE", f"{feats.get('avg_pe', 0):.0f}")
+            small = feats.get('small_cap_count', 0)
+            large = feats.get('large_cap_count', 0)
+            st.metric("小盘(<50亿)/大盘(>=200亿)", f"{small}/{large}")
+        
+        # 行业分布
+        by_ind = lu.get("by_industry", [])
+        if by_ind:
+            st.caption("**涨停行业集中度**（涨停数TOP8）：")
+            ind_text = " | ".join([f"{ind}({cnt}只)" for ind, cnt in by_ind])
+            st.caption(ind_text)
+            
+            # 集中度判断
+            total_ind = sum(cnt for _, cnt in by_ind)
+            top3_cnt = sum(cnt for _, cnt in by_ind[:3])
+            if top3_cnt / max(total_lu, 1) > 0.6:
+                st.success(f"🎯 涨停高度集中：前3行业占{top3_cnt}/{total_lu}（{top3_cnt/total_lu*100:.0f}%），主线明确")
+            else:
+                st.info(f"📊 涨停分散：前3行业仅占{top3_cnt}/{total_lu}（{top3_cnt/total_lu*100:.0f}%），轮动快")
 
         st.divider()
 

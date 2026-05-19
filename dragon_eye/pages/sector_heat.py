@@ -37,29 +37,44 @@ def _cached_industry_sectors() -> list:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_concept_sectors_tdx() -> list:
-    """从TDX本地 infoharbor_block.dat 加载概念板块 + TDX动量"""
+    """从TDX本地 infoharbor_block.dat 加载概念板块 + TDX动量（批量加载，14s一次）"""
     from dragon_eye.sector.ths_sector import TdxSectorMapper, SectorStrength, SectorRanker
     from dragon_eye.sector.tdx_sector_reader import TdxSectorReader
     
     mapper = TdxSectorMapper()
     mapper.load_infoharbor()
     
-    # 加载TDX动量数据
+    # 批量加载全部TDX板块动量（一次14.4s，而非610次逐文件读取）
     tdx = TdxSectorReader()
     tdx.load_sector_map()
+    all_mom = tdx.get_all_sectors()  # 1070板块，14.4s
+    
+    # 构建名称→动量查找表
+    mom_lookup = {}
+    if not all_mom.empty:
+        for _, row in all_mom.iterrows():
+            mom_lookup[row['name']] = {
+                'change_pct': row.get('change_pct', 0.0),
+                'momentum_3d': row.get('momentum_3d', 0.0),
+                'momentum_5d': row.get('momentum_5d', 0.0),
+            }
     
     ranker = SectorRanker()
     sectors = []
     for concept_name, stocks in mapper._concept_map.items():
-        # 关联TDX动量
-        mom_3d, mom_5d, chg_pct = 0.0, 0.0, 0.0
-        tdx_code = tdx.get_code(concept_name)
-        if tdx_code:
-            mom = tdx.get_momentum(concept_name)
-            if mom:
-                chg_pct = mom.get("change_pct", 0.0)
-                mom_3d = mom.get("momentum_3d", 0.0)
-                mom_5d = mom.get("momentum_5d", 0.0)
+        # 先精确匹配，再模糊匹配TDX板块名
+        tdx_name = concept_name
+        if concept_name not in mom_lookup:
+            tdx_code = tdx.get_code(concept_name)
+            if tdx_code:
+                tdx_name = concept_name  # get_momentum内部会处理模糊匹配
+            else:
+                tdx_name = None
+        
+        mom = mom_lookup.get(tdx_name, {}) if tdx_name else {}
+        chg_pct = mom.get('change_pct', 0.0)
+        mom_3d = mom.get('momentum_3d', 0.0)
+        mom_5d = mom.get('momentum_5d', 0.0)
         
         s = SectorStrength(
             name=concept_name,
