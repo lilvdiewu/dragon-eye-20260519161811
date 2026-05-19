@@ -75,6 +75,14 @@ with st.sidebar:
                 st.error("❌ 缓存构建失败，请检查网络连接")
         st.rerun()
 
+    if st.button("🔄 刷新概念板块", use_container_width=True):
+        with st.spinner("正在拉取概念板块数据..."):
+            from dragon_eye.pages.sector_heat import _cached_concept_sectors
+            _cached_concept_sectors.clear()
+            _cached_concept_sectors()
+            st.success("✅ 概念板块数据已刷新", icon="🎉")
+        st.rerun()
+
     st.divider()
     st.caption("数据来源: 通达信本地 + AkShare")
 

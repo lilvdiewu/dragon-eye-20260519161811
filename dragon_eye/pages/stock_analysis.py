@@ -140,6 +140,9 @@ def render():
 
     st.subheader(f"{stock_name} ({code})")
 
+    # ---- 行业/概念归属 + 板块表现 ----
+    _render_sector_context(code)
+
     # ---- K线图（本地数据，秒出） ----
     _render_kline_chart(klines, stock_name)
 
@@ -689,6 +692,65 @@ def _render_ta_decision_card(result):
     """, unsafe_allow_html=True)
 
     # 关键指标
+
+
+# ============================================================
+# 板块关联分析（个股→板块→板块涨跌）
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_sector_context(code6: str) -> dict:
+    """获取个股的行业/概念归属及板块涨跌"""
+    from dragon_eye.sector.ths_sector import TdxSectorMapper
+    mapper = TdxSectorMapper()
+    mapper.load_all()
+
+    result = {
+        "industry": mapper.get_industry(code6),
+        "concepts": mapper.get_concepts(code6)[:8],
+        "sector_perf": {},
+    }
+
+    # 查行业板块涨跌
+    try:
+        from dragon_eye.pages.sector_heat import _cached_industry_sectors, _cached_concept_sectors
+        ind_sectors = _cached_industry_sectors()
+        con_sectors = _cached_concept_sectors()
+        all_sectors = {s.name: s.change_pct for s in ind_sectors + con_sectors if s.change_pct != 0}
+        result["sector_perf"] = all_sectors
+    except Exception:
+        pass
+
+    return result
+
+
+def _render_sector_context(code6: str):
+    """渲染板块归属 + 板块涨跌"""
+    ctx = _get_sector_context(code6)
+    if not ctx["industry"] and not ctx["concepts"]:
+        return
+
+    cols = []
+    if ctx["industry"]:
+        ind = ctx["industry"]
+        perf = ctx["sector_perf"].get(ind, None)
+        tag = f"🏭 {ind}"
+        if perf is not None:
+            color = "🟢" if perf > 0 else ("🔴" if perf < 0 else "⚪")
+            tag += f" {color} {perf:+.2f}%"
+        cols.append(tag)
+
+    for concept in ctx["concepts"][:5]:
+        perf = ctx["sector_perf"].get(concept, None)
+        tag = f"💡 {concept}"
+        if perf is not None:
+            color = "🟢" if perf > 0 else ("🔴" if perf < 0 else "⚪")
+            tag += f" {color} {perf:+.2f}%"
+        cols.append(tag)
+
+    if cols:
+        st.markdown("**板块归属** | " + " · ".join(cols))
+        st.caption("🟢上涨 🔴下跌 ⚪平盘")
     col1, col2, col3 = st.columns(3)
     col1.metric("评级", f"{result.rating_cn} ({result.rating})")
     col2.metric("参考入场价", f"{result.price_target:.2f}" if result.price_target else "--")
