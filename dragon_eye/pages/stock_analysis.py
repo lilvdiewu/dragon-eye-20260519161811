@@ -12,8 +12,20 @@ from datetime import datetime
 
 
 # ============================================================
-# 缓存层：避免每次交互都重新拉取网络数据
+# 缓存层：避免每次交互都重新拉取网络数据 / 重读本地文件
 # ============================================================
+
+@st.cache_resource(show_spinner=False)
+def _cached_reader():
+    """缓存通达信读取器（单例，避免反复初始化）"""
+    from dragon_eye.tdx_reader import get_reader
+    return get_reader()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_klines(code, market):
+    """缓存K线数据（2分钟过期，避免反复读本地文件）"""
+    reader = _cached_reader()
+    return reader.get_day_klines(code, market)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_stock_names() -> dict:
@@ -104,17 +116,15 @@ def render():
             st.info("输入股票代码、名称或拼音首字母搜索，选择后点击「快速分析」")
         return
 
-    # ---- 加载数据 ----
-    from dragon_eye.tdx_reader import get_reader
+    # ---- 加载数据（全部走缓存） ----
     from dragon_eye.data_models import market_from_code, Market
-    from dragon_eye.akshare_bridge import AkShareBridge
     from dragon_eye.signals import score_technical, ma
 
     market = market_from_code(code)
-    reader = get_reader()
+    reader = _cached_reader()
 
     with st.spinner("加载K线数据..."):
-        klines = reader.get_day_klines(code, market)
+        klines = _cached_klines(code, market)
 
     if not klines:
         st.error(f"未找到 {code} 的K线数据，请检查通达信数据目录")
@@ -177,15 +187,23 @@ def render():
 
 
 def _render_kline_chart(klines, title: str):
-    """绘制K线图 + 均线 + 成交量"""
+    """绘制K线图 + 均线 + 成交量（默认仅显示近1年，避免浏览器卡死）"""
     from dragon_eye.signals import ma as calc_ma
 
-    dates = [k.date for k in klines]
-    opens = [k.open for k in klines]
-    highs = [k.high for k in klines]
-    lows = [k.low for k in klines]
-    closes = [k.close for k in klines]
-    volumes = [k.volume for k in klines]
+    # ⚠️ 关键优化：只显示最近250个交易日（~1年），避免Plotly渲染6000+蜡烛图卡死浏览器
+    max_display = 250
+    if len(klines) > max_display:
+        display_klines = klines[-max_display:]
+        st.caption(f"📊 显示近 {max_display} 个交易日（共 {len(klines)} 天数据）")
+    else:
+        display_klines = klines
+
+    dates = [k.date for k in display_klines]
+    opens = [k.open for k in display_klines]
+    highs = [k.high for k in display_klines]
+    lows = [k.low for k in display_klines]
+    closes = [k.close for k in display_klines]
+    volumes = [k.volume for k in display_klines]
 
     # 均线
     closes_list = closes
