@@ -26,14 +26,14 @@ def _get_all_stocks_with_sectors():
     mapper = TdxSectorMapper()
     mapper.load_all()
     dbf = _get_dbf_reader()
-    stocks = dbf.get_all_stocks()
+    codes = dbf.get_all_codes()
+    code_to_name = getattr(dbf, '_code_to_name', {})
     result = []
-    for s in stocks:
-        code = s.get("code", "")
+    for code in codes:
         result.append({
             "code": code,
-            "name": s.get("name", code),
-            "market": "SH" if code.startswith("6") or code.startswith("9") else "SZ",
+            "name": code_to_name.get(code, code),
+            "market": "SH" if code.startswith(("6", "9")) else "SZ",
             "industry": mapper.get_industry(code),
             "concepts": mapper.get_concepts(code)[:5],
         })
