@@ -758,31 +758,41 @@ def _render_strategy_section(results: dict):
         gap = top3[0]["score"] - top3[1]["score"]
         st.caption(f"💪 {top3[0]['name']}领先{gap:.0f}分" if gap > 20 else f"⚖️ 差距仅{gap:.0f}分，明天可能轮动")
 
-    # 3. 候选池
+    # 3. 候选池（使用多因子推荐引擎）
     st.markdown("### 🎫 明日候选池")
-    candidates = []
-    theme_order = {t["name"]: i for i, t in enumerate(themes) if t} if themes else {}
-    for theme_name, heads in dragon_heads.items():
-        rank = theme_order.get(theme_name, 99)
-        for h in heads:
-            if h["composite"] > 0:
-                chg = h["chg_today"]
-                if chg >= 9.5: action = "涨停→竞价看强度"
-                elif chg >= 5: action = "强势→开0-2%可入"
-                elif chg >= 0: action = "温和→开0-1%可入"
-                else: action = "抗跌→翻红确认再入"
-                candidates.append({"code": h["code"], "name": h["name"], "theme": theme_name[:8],
-                                   "chg": f"{chg:+.1f}%", "score": f"{h['composite']:.1f}",
-                                   "turn": f"{h.get('turnover',0):.1f}%", "action": action,
-                                   "rank": rank, "is_limit": chg >= 9.5})
-    candidates.sort(key=lambda c: (c["is_limit"], -float(c["score"]), c["rank"]))
     
-    if candidates:
-        st.dataframe([{k: v for k, v in c.items() if k not in ("rank", "is_limit")} 
-                       for c in candidates[:10]], use_container_width=True, hide_index=True, height=380)
+    from dragon_eye.analysis.stock_recommender import get_recommender
+    
+    recommender = get_recommender()
+    recs = recommender.recommend(top_n=15, min_score=50)
+    
+    if recs:
+        rows = []
+        for r in recs:
+            rows.append({
+                "代码": r.code,
+                "名称": r.name,
+                "评分": f"{r.composite:.0f}",
+                "等级": r.grade,
+                "涨幅": f"{r.change_pct:+.1f}%",
+                "换手": f"{r.turnover:.1f}%",
+                "量比": f"{r.volume_ratio:.1f}",
+                "流入%": f"{r.flow_pct:.1f}%",
+                "板块": r.sector[:8],
+                "板块动量": f"3d{r.sector_momentum_3d:+.0f}%",
+                "操作": r.action,
+            })
+        
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=500)
+        
+        # 推荐理由详解
+        with st.expander("🔍 推荐理由详解"):
+            for r in recs[:10]:
+                reason_text = " | ".join(r.reasons) if r.reasons else "综合评分入选"
+                st.caption(f"**{r.name}**({r.code}) {r.grade}级 {r.composite:.0f}分 — {reason_text}")
+                st.caption(f"  买入: {r.entry_range} | 止损: {r.stop_loss}")
+        
         st.info("📋 **盘前检查**: 1.竞价低开>-3%的删 2.前10分钟不动手 3.单票≤15%仓位 4.龙头高开>5%不追 5.大盘开跌>1%不新开仓")
-    else:
-        st.caption("暂无明显候选")
 
     # 4. 资金验证
     sector_flows = fund_flow.get("sector_flow_rank", [])
