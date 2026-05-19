@@ -36,6 +36,33 @@ def _cached_industry_sectors() -> list:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _cached_concept_sectors_tdx() -> list:
+    """从TDX本地 infoharbor_block.dat 加载概念板块（含成分股数）"""
+    from dragon_eye.sector.ths_sector import TdxSectorMapper, SectorStrength, SectorRanker
+    mapper = TdxSectorMapper()
+    mapper.load_infoharbor()  # 只加载概念数据，不拉行业
+
+    ranker = SectorRanker()
+    sectors = []
+    for concept_name, stocks in mapper._concept_map.items():
+        s = SectorStrength(
+            name=concept_name,
+            sector_type="concept",
+            change_pct=0,
+            net_inflow=0,
+            turnover=0,
+            up_ratio=len(stocks) / 5000,  # 覆盖度指标
+        )
+        # 动态加成分股数
+        s.stock_count = len(stocks)
+        sectors.append(s)
+
+    if sectors:
+        sectors = ranker.rank(sectors)
+    return sectors
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _cached_concept_sectors() -> list:
     """缓存概念板块数据（5分钟过期）"""
     from dragon_eye.sector.ths_sector import ThsSectorFetcher, SectorRanker, SectorStrength
@@ -188,12 +215,12 @@ def _render_industry_sectors():
 
 
 def _render_concept_sectors():
-    """概念板块排名"""
-    with st.spinner("正在获取同花顺概念板块数据..."):
-        sectors = _cached_concept_sectors()
+    """概念板块排名（基于TDX本地 infoharbor_block.dat，含成分股数）"""
+    with st.spinner("正在加载TDX概念板块数据..."):
+        sectors = _cached_concept_sectors_tdx()
 
     if not sectors:
-        st.warning("⚠️ 概念板块数据获取失败，请检查网络连接")
+        st.warning("⚠️ 概念板块数据加载失败，请检查TDX数据")
         return
 
     # ---- 概念搜索 ----
@@ -203,19 +230,18 @@ def _render_concept_sectors():
     if search_keyword:
         filtered = [s for s in filtered if search_keyword in s.name]
 
-    # ---- 概念排名 ----
-    st.subheader(f"概念板块排名 ({len(filtered)} 个)")
+    # ---- 概念排名（按成分股数量+强度分） ----
+    st.subheader(f"概念板块 ({len(filtered)} 个)")
+    st.caption("📦 数据来源: TDX本地 infoharbor_block.dat | 成分股数=板块覆盖广度")
 
     rows = []
-    for s in filtered[:100]:  # 最多显示100个
-        change_color = "🔴" if s.change_pct < 0 else "🟢"
+    for s in filtered[:100]:
         rows.append({
             "概念": s.name,
             "等级": s.grade,
             "强度分": s.strength_score,
-            "涨跌幅": f"{change_color} {s.change_pct:+.2f}%",
-            "净流入(亿)": round(s.net_inflow, 2),
-            "轮动信号": s.rotation_signal,
+            "成分股数": s.stock_count if hasattr(s, 'stock_count') and s.stock_count else "--",
+            "联动性": f"{s.up_ratio:.0%}" if hasattr(s, 'up_ratio') and s.up_ratio else "——",
         })
 
     if rows:
@@ -223,20 +249,32 @@ def _render_concept_sectors():
     else:
         st.info("没有匹配的概念板块")
 
-    # ---- 热门概念 TOP20 ----
+    # ---- 热门概念 TOP20（按成分股数） ----
     st.divider()
-    st.subheader("热门概念 TOP20")
+    st.subheader("热门概念 TOP20（成分股最多）")
 
-    top20 = filtered[:20]
+    by_count = sorted(filtered, key=lambda s: getattr(s, 'stock_count', 0) or 0, reverse=True)
+    top20 = by_count[:20]
     if top20:
         fig = go.Figure(data=[
             go.Bar(
-                x=[s.change_pct for s in top20],
+                x=[getattr(s, 'stock_count', 0) or 0 for s in top20],
                 y=[s.name for s in top20],
                 orientation="h",
-                marker_color=["#ff4b4b" if s.change_pct > 0 else "#4baf4f" for s in top20],
-                text=[f"{s.change_pct:+.2f}%" for s in top20],
+                marker_color="#1f77b4",
+                text=[getattr(s, 'stock_count', 0) or 0 for s in top20],
                 textposition="outside",
+            )
+        ])
+        fig.update_layout(
+            title="成分股数量排名",
+            height=500,
+            margin=dict(l=20, r=40, t=40, b=20),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("数据不足")
             )
         ])
         fig.update_layout(
