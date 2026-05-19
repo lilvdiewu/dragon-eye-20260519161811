@@ -433,7 +433,49 @@ def get_news_dragon_eye(
     news_str = ""
     article_count = 0
 
+    # ── 0. 东方财富个股新闻（最优先，能抓到调研/公告）──
+    try:
+        import requests as _req
+        _sess = _req.Session()
+        _sess.trust_env = False
+        stock_news_url = "https://np-listapi.eastmoney.com/comm/web/getNewsByCode"
+        stock_params = {
+            "client": "web",
+            "biz": "web_news_stock",
+            "code": code6,
+            "order": "1",
+            "page_index": "1",
+            "page_size": "15",
+            "fields": "title,showTime,mediaName,srcUrl,content,digest",
+        }
+        resp = _sess.get(stock_news_url, params=stock_params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            stock_articles = data.get("data", {}).get("list", [])
+            if stock_articles:
+                news_str += "## Stock-Specific News (Eastmoney)\n\n"
+                for a in stock_articles[:12]:
+                    title = a.get("title", "")
+                    media = a.get("mediaName", "")
+                    show_time = a.get("showTime", "")
+                    digest = (a.get("digest", "") or a.get("content", ""))
+                    if digest and len(digest) > 300:
+                        digest = digest[:300] + "..."
+                    link = a.get("srcUrl", "")
+                    news_str += f"### {title} (source: {media})\n"
+                    if show_time:
+                        news_str += f"Time: {show_time}\n"
+                    if digest:
+                        news_str += f"{digest}\n"
+                    if link:
+                        news_str += f"Link: {link}\n"
+                    news_str += "\n"
+                    article_count += 1
+    except Exception:
+        pass
+
     # ── 1. 东方财富7x24快讯 ──
+    articles = []
     try:
         import requests as _req
         _sess = _req.Session()
