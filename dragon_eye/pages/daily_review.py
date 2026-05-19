@@ -1,12 +1,10 @@
 """
-盘后深度复盘 — 每日收盘后运行
+盘后深度复盘 v2 — 数据驱动，拒绝笼统
 
-核心理念：不追求快，追求深度。
-像第二个交易员跟你一起复盘，补你一个人看不到的维度。
+核心理念：每一个结论都有具体数字支撑。
 """
 import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 
 # ============================================================
@@ -18,51 +16,40 @@ def _get_today_date():
     return datetime.now().strftime("%Y-%m-%d")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _get_all_stocks_with_sectors():
-    """获取全市场股票 + 行业/概念归属"""
+@st.cache_data(ttl=600, show_spinner=False)
+def _get_stat_reader():
+    """TDX行情统计读取器（7866只股票，35字段）"""
+    from dragon_eye.analysis.tdx_stat_reader import get_stat_reader
+    return get_stat_reader()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _get_sector_mapper():
+    """行业/概念映射"""
     from dragon_eye.sector.ths_sector import TdxSectorMapper
+    m = TdxSectorMapper()
+    m.load_all()
+    return m
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _get_stock_names():
+    """股票代码→名称"""
     from dragon_eye.dataflows.dragon_eye_vendor import _get_dbf_reader
-    mapper = TdxSectorMapper()
-    mapper.load_all()
     dbf = _get_dbf_reader()
-    codes = dbf.get_all_codes()
-    code_to_name = getattr(dbf, '_code_to_name', {})
-    result = []
-    for code in codes:
-        result.append({
-            "code": code,
-            "name": code_to_name.get(code, code),
-            "market": "SH" if code.startswith(("6", "9")) else "SZ",
-            "industry": mapper.get_industry(code),
-            "concepts": mapper.get_concepts(code)[:5],
-        })
-    return result
+    return getattr(dbf, '_code_to_name', {})
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _get_industry_sectors():
-    """行业板块排名（含涨跌幅）"""
     from dragon_eye.pages.sector_heat import _cached_industry_sectors
     return _cached_industry_sectors()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _get_concept_sectors():
-    """概念板块排名（TDX本地）"""
     from dragon_eye.pages.sector_heat import _cached_concept_sectors_tdx
     return _cached_concept_sectors_tdx()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _get_kline_for_code(code6: str, market: str):
-    """获取个股K线（缓存共用）"""
-    from dragon_eye.tdx_reader import TdxReader
-    reader = TdxReader()
-    try:
-        return reader.get_day_klines(code6, market)
-    except Exception:
-        return []
 
 
 # ============================================================
@@ -73,13 +60,20 @@ def render():
     st.header("📋 盘后深度复盘")
 
     date = _get_today_date()
-    st.caption(f"📅 {date} · 点击下方按钮开始分析")
+    st.caption(f"📅 {date} · 数据源: TDX本地 (tdxstat.cfg + tdxstat2.cfg)")
 
+    # 自动检测：如果市场已收盘（>15:00），默认开启
+    auto_run = datetime.now().hour >= 15
+
+    if auto_run:
+        st.info("🕒 已过收盘时间，点击下方按钮开始复盘")
+    
     if st.button("🔍 开始盘后复盘", type="primary", use_container_width=True):
-        with st.spinner("正在深度复盘，请稍候（约30-60秒）..."):
+        with st.spinner("正在深度复盘..."):
             results = _run_deep_review()
-
         _render_review_report(results)
+    elif not auto_run:
+        st.caption("💡 建议收盘后(15:00)运行，数据最完整")
 
 
 # ============================================================
@@ -87,19 +81,21 @@ def render():
 # ============================================================
 
 def _run_deep_review() -> dict:
-    """执行深度复盘，返回结构化结果"""
     results = {}
 
-    # 1. 主线确认
+    # 1. 主线确认（含板块内个股统计）
     results["main_themes"] = _analyze_main_themes()
 
-    # 2. 龙头梳理
+    # 2. 龙头识别（含具体数据）
     results["dragon_heads"] = _identify_dragon_heads(results["main_themes"])
 
-    # 3. 市场情绪
-    results["sentiment"] = _assess_sentiment()
+    # 3. 市场全景
+    results["market_overview"] = _assess_market_overview()
 
-    # 4. 联动分析
+    # 4. 资金流向
+    results["fund_flow"] = _analyze_fund_flow()
+
+    # 5. 板块联动
     results["sector_linkage"] = _analyze_sector_linkage(results["main_themes"])
 
     return results
@@ -107,187 +103,284 @@ def _run_deep_review() -> dict:
 
 def _analyze_main_themes() -> list:
     """
-    主线确认：不只是看今天涨跌，看多日持续性
-    - 行业板块按强度分排序
-    - 标记主线候选（连续走强 + 有龙头带队）
+    主线确认：行业 + 概念，含板块内涨跌比
     """
     ind_sectors = _get_industry_sectors()
     con_sectors = _get_concept_sectors()
+    stats = _get_stat_reader()
+    mapper = _get_sector_mapper()
+    names = _get_stock_names()
 
     themes = []
 
-    # 行业板块排名
+    # 行业板块
     if ind_sectors:
-        st.info(f"📊 行业板块分析：{len(ind_sectors)} 个板块")
-        # 按强度分排序取前10
-        top_ind = sorted(ind_sectors, key=lambda s: s.strength_score, reverse=True)[:10]
+        top_ind = sorted(ind_sectors, key=lambda s: s.strength_score, reverse=True)[:8]
         for s in top_ind:
+            # 统计板块内个股表现
+            sector_stocks = _get_stocks_in_sector(s.name, "industry", mapper)
+            sector_change = _calc_sector_change(sector_stocks, stats)
+
             themes.append({
                 "name": s.name,
                 "type": "行业",
                 "grade": s.grade,
                 "score": s.strength_score,
                 "change_pct": s.change_pct,
-                "inflow": getattr(s, 'net_inflow', 0),
-                "rotation": getattr(s, 'rotation_signal', ''),
-                "stock_count": 0,  # 行业没有成分股数
+                "breadth": sector_change.get("breadth", 0),    # 涨跌比
+                "up_count": sector_change.get("up_count", 0),
+                "down_count": sector_change.get("down_count", 0),
+                "leader_name": sector_change.get("leader_name", ""),
+                "leader_code": sector_change.get("leader_code", ""),
+                "leader_chg": sector_change.get("leader_chg", 0),
             })
 
-    # 概念板块排名（按成分股数+强度排序）
+    # 概念板块
     if con_sectors:
-        st.info(f"📊 概念板块分析：{len(con_sectors)} 个板块")
-        top_con = sorted(con_sectors, key=lambda s: s.strength_score, reverse=True)[:15]
+        top_con = sorted(con_sectors, key=lambda s: s.strength_score, reverse=True)[:10]
         for s in top_con:
             stock_cnt = getattr(s, 'stock_count', 0) or 0
+            sector_stocks = _get_stocks_in_sector(s.name, "concept", mapper)
+            sector_change = _calc_sector_change(sector_stocks, stats)
+
             themes.append({
                 "name": s.name,
                 "type": "概念",
                 "grade": s.grade,
                 "score": s.strength_score,
-                "change_pct": s.change_pct,
-                "inflow": 0,
-                "rotation": "",
+                "change_pct": s.change_pct or 0,
+                "breadth": sector_change.get("breadth", 0),
+                "up_count": sector_change.get("up_count", 0),
+                "down_count": sector_change.get("down_count", 0),
+                "leader_name": sector_change.get("leader_name", ""),
+                "leader_code": sector_change.get("leader_code", ""),
+                "leader_chg": sector_change.get("leader_chg", 0),
                 "stock_count": stock_cnt,
             })
 
-    # 综合排序
     themes.sort(key=lambda t: t["score"], reverse=True)
     return themes
 
 
+def _get_stocks_in_sector(sector_name: str, sector_type: str, mapper) -> set:
+    """获取板块内股票代码集合"""
+    codes = set()
+    if sector_type == "concept":
+        stocks = mapper._concept_map.get(sector_name, [])
+        codes = set(stocks)
+    else:
+        for code, ind in mapper._industry_map.items():
+            if ind == sector_name:
+                codes.add(code)
+    return codes
+
+
+def _calc_sector_change(codes: set, stats) -> dict:
+    """计算板块内涨跌统计"""
+    if not codes:
+        return {"breadth": 0, "up_count": 0, "down_count": 0}
+
+    up, down, total = 0, 0, 0
+    best_code, best_chg = "", -999
+    best_name = ""
+    names = _get_stock_names()
+
+    for code in codes:
+        stat = stats.get_stat(code)
+        if stat is None:
+            continue
+        total += 1
+        if stat.change_pct > 0:
+            up += 1
+        elif stat.change_pct < 0:
+            down += 1
+
+        if stat.change_pct > best_chg:
+            best_chg = stat.change_pct
+            best_code = code
+            best_name = names.get(code, code)
+
+    breadth = up / max(total, 1)
+    return {
+        "breadth": breadth,
+        "up_count": up,
+        "down_count": down,
+        "total": total,
+        "leader_code": best_code,
+        "leader_name": best_name,
+        "leader_chg": best_chg,
+    }
+
+
 def _identify_dragon_heads(themes: list) -> dict:
     """
-    主线龙头识别：在每个热点板块里找龙头
-    - 涨幅最大
-    - 成交量最大
-    - K线位置（突破/高位/低位）
+    龙头识别：每个主线里找最强个股，含详细数据
     """
     if not themes:
         return {}
 
-    stocks = _get_all_stocks_with_sectors()
+    stats = _get_stat_reader()
+    mapper = _get_sector_mapper()
+    names = _get_stock_names()
     heads = {}
 
-    # 取前5个主线
-    for theme in themes[:5]:
+    for theme in themes[:6]:
         theme_name = theme["name"]
-        # 找属于这个板块的股票
-        members = []
-        for s in stocks:
-            if theme["type"] == "行业" and s["industry"] == theme_name:
-                members.append(s)
-            elif theme["type"] == "概念" and theme_name in s["concepts"]:
-                members.append(s)
-
-        if not members:
+        codes = _get_stocks_in_sector(theme_name, theme["type"], mapper)
+        if not codes:
             continue
 
-        # 分析每只成分股的最近表现
-        stock_scores = []
-        for member in members[:50]:  # 限制数量
-            kl = _get_kline_for_code(member["code"], member["market"])
-            if not kl or len(kl) < 5:
+        stock_data = []
+        for code in codes:
+            stat = stats.get_stat(code)
+            stat2 = stats.get_stat2(code)
+            if stat is None:
                 continue
 
-            # 近5日涨幅
-            latest_close = kl[-1].close
-            day5_close = kl[-5].close if len(kl) >= 5 else kl[0].close
-            chg_5d = (latest_close - day5_close) / day5_close * 100
+            name = names.get(code, code)
+            net_flow = stat2.flow_net if stat2 else 0
 
-            # 近1日涨幅 + 放量情况
-            today_chg = (kl[-1].close - kl[-2].close) / kl[-2].close * 100 if len(kl) >= 2 else 0
-            today_vol = kl[-1].volume
-            prev_vol = kl[-2].volume if len(kl) >= 2 else 1
-            vol_ratio = today_vol / prev_vol if prev_vol > 0 else 1
+            # 综合评分：涨幅 + 换手(活性) + 资金 + 市值(适中为好)
+            mv_score = 0
+            if stat.total_mv > 0:
+                mv_yi = stat.total_mv / 10000  # 万元→亿
+                mv_score = 0 if mv_yi < 20 else (10 if mv_yi < 500 else 5)  # 20-500亿最优
 
-            # 位置判断
-            ma5 = sum(k.close for k in kl[-5:]) / min(5, len(kl))
-            position = "突破高位" if latest_close > ma5 * 1.05 else ("支撑位" if latest_close < ma5 * 0.95 else "均线附近")
+            composite = (
+                stat.change_pct * 0.35 +
+                min(stat.turnover, 15) * 0.15 +  # 换手率15%封顶
+                (1 if net_flow > 0 else -1) * min(abs(net_flow) / 100000, 10) * 0.2 +
+                mv_score * 0.1 +
+                stat.chg_20d * 0.1 +
+                stat.chg_60d * 0.1
+            )
 
-            stock_scores.append({
-                "code": member["code"],
-                "name": member["name"],
-                "chg_today": today_chg,
-                "chg_5d": chg_5d,
-                "vol_ratio": vol_ratio,
-                "position": position,
-                "composite": today_chg * 0.5 + chg_5d * 0.3 + (vol_ratio - 1) * 2,
+            stock_data.append({
+                "code": code,
+                "name": name,
+                "chg_today": stat.change_pct,
+                "chg_5d": stat.chg_20d / 4 if stat.chg_20d else 0,  # 近似
+                "chg_20d": stat.chg_20d,
+                "turnover": stat.turnover,
+                "pe": stat.pe,
+                "mv_yi": stat.total_mv / 10000 if stat.total_mv > 0 else 0,
+                "net_flow_yi": net_flow / 10000 if net_flow else 0,
+                "composite": composite,
             })
 
-        if stock_scores:
-            stock_scores.sort(key=lambda x: x["composite"], reverse=True)
-            heads[theme_name] = stock_scores[:5]  # 前5只龙头候选
+        if stock_data:
+            stock_data.sort(key=lambda x: x["composite"], reverse=True)
+            heads[theme_name] = stock_data[:6]
 
     return heads
 
 
-def _assess_sentiment() -> dict:
+def _assess_market_overview() -> dict:
     """
-    市场情绪评估
-    维度：
-    - 涨跌比（全市场）
-    - 涨停/跌停数量（需要东方财富数据，这里用TDX近似）
-    - 成交额变化
-    - 连板高度
+    市场全景：涨跌分布、涨停板统计、成交额
     """
-    # 基于现有数据做粗略评估
-    ind_sectors = _get_industry_sectors()
+    stats = _get_stat_reader()
 
-    up_count = sum(1 for s in ind_sectors if s.change_pct > 0)
-    down_count = sum(1 for s in ind_sectors if s.change_pct < 0)
-    total = len(ind_sectors) if ind_sectors else 1
+    up_count, down_count, flat_count = 0, 0, 0
+    limit_up, limit_down = 0, 0
+    total_amount = 0.0
+    valid = 0
 
-    up_ratio = up_count / total if total > 0 else 0.5
+    for code, stat in stats._stats.items():
+        if abs(stat.change_pct) < 0.01:
+            flat_count += 1
+        elif stat.change_pct > 0:
+            up_count += 1
+            if stat.change_pct >= 9.8:  # 涨停（含创业板20%）
+                limit_up += 1
+        else:
+            down_count += 1
+            if stat.change_pct <= -9.8:
+                limit_down += 1
 
-    if up_ratio >= 0.7:
-        mood = "亢奋 🟢"
-        advice = "板块普涨，追高需警惕分歧"
-        score = 80
-    elif up_ratio >= 0.5:
-        mood = "温和 🟡"
-        advice = "正常轮动，按计划执行"
-        score = 60
-    elif up_ratio >= 0.3:
-        mood = "偏弱 🟠"
-        advice = "多数板块下跌，控制仓位"
-        score = 40
+        total_amount += stat.amount
+        valid += 1
+
+    total = up_count + down_count + flat_count
+    up_ratio = up_count / max(total, 1)
+
+    # 情绪判断
+    if limit_up >= 100 and up_ratio >= 0.7:
+        mood = "🔥 亢奋"
+        advice = "涨停潮+普涨，注意高潮次日分歧。追高谨慎，关注前排龙头分歧转一致。"
+    elif limit_up >= 50 and up_ratio >= 0.55:
+        mood = "🟢 偏暖"
+        advice = "赚钱效应好，主线明确，可按计划积极操作。"
+    elif up_ratio >= 0.45:
+        mood = "🟡 中性"
+        advice = "涨跌参半，轮动较快。只做最强，杂毛不碰。"
+    elif limit_down >= 30:
+        mood = "🔴 偏冷"
+        advice = "跌停增加，亏钱效应扩散。防守为主，减仓观望。"
     else:
-        mood = "冰点 🔴"
-        advice = "恐慌蔓延，观望为主，盯紧逆势板块"
-        score = 20
+        mood = "🧊 冰点"
+        advice = "恐慌释放中。可小仓位试错逆势抗跌品种，等情绪修复。"
 
     return {
-        "up_ratio": up_ratio,
         "up_count": up_count,
         "down_count": down_count,
-        "total": total,
+        "flat_count": flat_count,
+        "up_ratio": up_ratio,
+        "limit_up": limit_up,
+        "limit_down": limit_down,
+        "total_amount": total_amount,
+        "total_stocks": valid,
         "mood": mood,
         "advice": advice,
-        "score": score,
+    }
+
+
+def _analyze_fund_flow() -> dict:
+    """
+    资金流向：主力净流入TOP + 行业分布
+    """
+    stats = _get_stat_reader()
+    mapper = _get_sector_mapper()
+    names = _get_stock_names()
+
+    # 主力净流入TOP30
+    top_flows = stats.get_top_by_net_flow(30)
+
+    flow_list = []
+    sector_flow: dict[str, float] = {}
+
+    for s in top_flows:
+        name = names.get(s.code, s.code)
+        industry = mapper.get_industry(s.code)
+        if industry:
+            sector_flow[industry] = sector_flow.get(industry, 0) + s.flow_net
+
+        flow_list.append({
+            "code": s.code,
+            "name": name,
+            "net_flow_yi": s.flow_net / 10000,  # 亿元
+            "flow_pct": s.flow_pct,
+        })
+
+    # 行业资金流入排名
+    sector_flow_rank = sorted(sector_flow.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "top_stocks": flow_list,
+        "sector_flow_rank": [{"sector": k, "flow_yi": v / 10000} for k, v in sector_flow_rank],
     }
 
 
 def _analyze_sector_linkage(themes: list) -> dict:
-    """
-    板块联动分析：哪些板块之间关联性强
-    - 通过概念重叠度判断
-    """
+    """板块联动"""
     if len(themes) < 2:
-        return {"pairs": [], "note": "板块数量不足，无法做联动分析"}
+        return {"pairs": []}
 
-    # 取前10个主题，计算两两重叠
-    top_themes = themes[:10]
-    stocks = _get_all_stocks_with_sectors()
+    mapper = _get_sector_mapper()
 
-    # 为每个主题建股票集合
     theme_stocks = {}
-    for t in top_themes:
-        tset = set()
-        for s in stocks:
-            if t["type"] == "行业" and s["industry"] == t["name"]:
-                tset.add(s["code"])
-            elif t["type"] == "概念" and t["name"] in s["concepts"]:
-                tset.add(s["code"])
+    for t in themes[:10]:
+        tset = _get_stocks_in_sector(t["name"], t["type"], mapper)
         theme_stocks[t["name"]] = tset
 
     pairs = []
@@ -299,7 +392,7 @@ def _analyze_sector_linkage(themes: list) -> dict:
             if not set_i or not set_j:
                 continue
             overlap = len(set_i & set_j) / min(len(set_i), len(set_j)) if min(len(set_i), len(set_j)) > 0 else 0
-            if overlap > 0.1:
+            if overlap > 0.05:
                 pairs.append({
                     "sector_a": names[i],
                     "sector_b": names[j],
@@ -307,7 +400,7 @@ def _analyze_sector_linkage(themes: list) -> dict:
                 })
 
     pairs.sort(key=lambda p: p["overlap"], reverse=True)
-    return {"pairs": pairs[:10], "note": ""}
+    return {"pairs": pairs[:15]}
 
 
 # ============================================================
@@ -315,61 +408,67 @@ def _analyze_sector_linkage(themes: list) -> dict:
 # ============================================================
 
 def _render_review_report(results: dict):
-    """渲染复盘报告"""
     st.divider()
     st.subheader("📋 深度复盘报告")
 
-    # === 一、市场情绪 ===
-    sentiment = results.get("sentiment", {})
-    if sentiment:
-        st.markdown("## 🎯 一、市场情绪")
-        mood = sentiment.get("mood", "未知")
-        advice = sentiment.get("advice", "")
-        score = sentiment.get("score", 50)
-        up_count = sentiment.get("up_count", 0)
-        down_count = sentiment.get("down_count", 0)
+    # === 一、市场全景 ===
+    overview = results.get("market_overview", {})
+    if overview:
+        st.markdown("## 📊 一、市场全景")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("情绪状态", mood)
-            st.metric("上涨板块", up_count)
+            st.metric("上涨家数", f"{overview.get('up_count', 0):,}")
         with col2:
-            st.metric("情绪分", f"{score}/100")
-            st.metric("下跌板块", down_count)
+            st.metric("下跌家数", f"{overview.get('down_count', 0):,}")
+        with col3:
+            st.metric("涨停", f"{overview.get('limit_up', 0)} 只")
+        with col4:
+            st.metric("跌停", f"{overview.get('limit_down', 0)} 只")
 
-        st.info(f"💡 **建议**: {advice}")
+        col5, col6 = st.columns(2)
+        with col5:
+            st.metric("涨跌比", f"{overview.get('up_ratio', 0):.0%}")
+        with col6:
+            total_yi = overview.get('total_amount', 0) / 1e8
+            st.metric("成交额", f"{total_yi:.0f}亿")
+
+        mood = overview.get("mood", "")
+        st.info(f"**市场情绪**: {mood}")
+        st.success(f"**建议**: {overview.get('advice', '')}")
         st.divider()
 
-    # === 二、主线板块 ===
+    # === 二、主线板块（含个股涨幅统计）===
     themes = results.get("main_themes", [])
     if themes:
-        st.markdown("## 🔥 二、主线板块 TOP15")
+        st.markdown("## 🔥 二、主线板块")
 
         rows = []
         for i, t in enumerate(themes[:15], 1):
-            change_str = f"{t['change_pct']:+.2f}%" if t['change_pct'] else "——"
-            inflow_str = f"{t['inflow']:.2f}亿" if t.get('inflow') else "——"
             type_icon = "🏭" if t["type"] == "行业" else "💡"
-            stock_cnt = f"{t['stock_count']}只" if t['stock_count'] else "——"
+            breadth_bar = _breadth_bar(t.get("breadth", 0))
+
+            leader = ""
+            if t.get("leader_name"):
+                chg_str = f"{t['leader_chg']:+.2f}%"
+                chg_icon = "🔴" if t['leader_chg'] > 0 else "🟢"
+                leader = f"{chg_icon} {t['leader_name']}({t['leader_code']}) {chg_str}"
 
             rows.append({
                 "#": i,
                 "板块": f"{type_icon} {t['name']}",
-                "类型": t["type"],
-                "等级": t["grade"],
-                "强度分": f"{t['score']:.0f}",
-                "涨跌": change_str,
-                "资金": inflow_str,
-                "成分股": stock_cnt,
+                "强度": f"{t['score']:.0f} ({t['grade']})",
+                "涨跌比": f"{t.get('up_count',0)}↑/{t.get('down_count',0)}↓ {breadth_bar}",
+                "领涨龙头": leader,
             })
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=600)
         st.divider()
 
-    # === 三、龙头候选 ===
+    # === 三、龙头深度分析 ===
     dragon_heads = results.get("dragon_heads", {})
     if dragon_heads:
-        st.markdown("## 👑 三、龙头候选")
+        st.markdown("## 👑 三、主线龙头深度分析")
 
         tabs = st.tabs(list(dragon_heads.keys())[:5])
         for idx, (theme_name, heads) in enumerate(dragon_heads.items()):
@@ -379,87 +478,175 @@ def _render_review_report(results: dict):
                 if heads:
                     head_rows = []
                     for h in heads:
-                        chg_icon = "🟢" if h["chg_today"] > 0 else "🔴"
+                        chg_icon = "🔴" if h["chg_today"] > 0 else "🟢"
+                        mv_str = f"{h['mv_yi']:.0f}亿" if h['mv_yi'] > 0 else "——"
+                        turn_str = f"{h['turnover']:.1f}%" if h['turnover'] > 0 else "——"
+                        flow_str = f"{h['net_flow_yi']:+.1f}亿" if h['net_flow_yi'] != 0 else "——"
+
                         head_rows.append({
                             "代码": h["code"],
                             "名称": h["name"],
-                            "今日涨跌": f"{chg_icon} {h['chg_today']:+.2f}%",
-                            "近5日": f"{h['chg_5d']:+.2f}%",
-                            "量比": f"{h['vol_ratio']:.1f}",
-                            "位置": h["position"],
+                            "今日": f"{chg_icon} {h['chg_today']:+.2f}%",
+                            "20日": f"{h['chg_20d']:+.1f}%",
+                            "换手": turn_str,
+                            "PE": f"{h['pe']:.1f}" if h['pe'] > 0 else "亏损",
+                            "市值": mv_str,
+                            "主力净额": flow_str,
                             "综合分": f"{h['composite']:.1f}",
                         })
                     st.dataframe(head_rows, use_container_width=True, hide_index=True)
-                    st.caption("💡 综合分 = 今日涨幅×0.5 + 5日涨幅×0.3 + 放量溢价")
+
+                    # 提示
+                    top_stock = heads[0]
+                    st.caption(
+                        f"💡 **{top_stock['name']}** 综合最强：今日{top_stock['chg_today']:+.2f}%，"
+                        f"20日{top_stock['chg_20d']:+.1f}%，市值约{top_stock['mv_yi']:.0f}亿。"
+                        f"\"{'适合短线关注' if abs(top_stock['chg_today']) < 9.5 else '已涨停，明天看分歧'}\"。"
+                    )
                 else:
-                    st.info("该板块未找到有效龙头候选")
+                    st.info("未找到有效龙头")
         st.divider()
 
-    # === 四、板块联动 ===
+    # === 四、资金流向 ===
+    fund_flow = results.get("fund_flow", {})
+    if fund_flow:
+        st.markdown("## 💰 四、主力资金动向")
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.subheader("个股净流入 TOP15")
+            top_stocks = fund_flow.get("top_stocks", [])[:15]
+            if top_stocks:
+                flow_rows = []
+                for s in top_stocks:
+                    flow_rows.append({
+                        "名称": f"{s['name']}({s['code']})",
+                        "净流入(亿)": f"{s['net_flow_yi']:+.1f}",
+                        "占比": f"{s['flow_pct']:.1f}%",
+                    })
+                st.dataframe(flow_rows, use_container_width=True, hide_index=True)
+
+        with col_right:
+            st.subheader("行业资金流入 TOP10")
+            sector_flows = fund_flow.get("sector_flow_rank", [])[:10]
+            if sector_flows:
+                import plotly.graph_objects as go
+                fig = go.Figure(data=[
+                    go.Bar(
+                        x=[sf["flow_yi"] for sf in sector_flows],
+                        y=[sf["sector"] for sf in sector_flows],
+                        orientation="h",
+                        marker_color=["#ff4b4b" if sf["flow_yi"] > 0 else "#4baf4f" for sf in sector_flows],
+                    )
+                ])
+                fig.update_layout(height=350, margin=dict(l=20, r=20, t=10, b=20))
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+    # === 五、板块联动 ===
     linkage = results.get("sector_linkage", {})
     pairs = linkage.get("pairs", [])
     if pairs:
-        st.markdown("## 🔗 四、板块联动（重叠度>10%）")
-        st.caption("重叠度高说明两个板块的股票大量重合，可能联动涨跌")
-
-        link_rows = []
-        for p in pairs:
-            link_rows.append({
-                "板块A": p["sector_a"],
-                "板块B": p["sector_b"],
-                "重叠度": f"{p['overlap']:.0%}",
-            })
-        st.dataframe(link_rows, use_container_width=True, hide_index=True)
+        st.markdown("## 🔗 五、板块联动")
+        linked = [p for p in pairs if p["overlap"] >= 0.15]
+        if linked:
+            for p in linked[:8]:
+                st.caption(f"⚡ **{p['sector_a']}** ↔ **{p['sector_b']}** — 重叠度 {p['overlap']:.0%}，联动概率高")
+        else:
+            st.caption("板块间联动关系较弱，各自独立走势为主")
         st.divider()
 
-    # === 五、明日操作建议 ===
-    st.markdown("## 📝 五、明日操作思路")
+    # === 六、明日操作思路 ===
+    st.markdown("## 📝 六、明日操作思路")
 
-    sentiment_score = sentiment.get("score", 50)
-    if sentiment_score >= 70:
-        st.success("**节奏**: 市场情绪偏暖，可按计划积极操作。关注主线龙头分歧转一致机会。")
-    elif sentiment_score >= 50:
-        st.warning("**节奏**: 中性市况。不追高，等待回调确认。控制在主线范围内。")
+    overview = results.get("market_overview", {})
+    limit_up = overview.get("limit_up", 0)
+
+    # 主线前三
+    top3 = themes[:3] if themes else []
+    if limit_up >= 100:
+        st.warning(
+            f"**节奏**：涨停{limit_up}只，市场处于高潮期。\n\n"
+            f"**主线**：{' → '.join([t['name'] for t in top3])}\n\n"
+            f"**策略**：不追缩量一字板。关注今日封板但放量的龙头，明早竞价确认强度后介入。"
+            f"如果竞价高开8%以上直接放弃，等盘中回踩。"
+        )
+    elif limit_up >= 50:
+        st.info(
+            f"**节奏**：涨停{limit_up}只，做多窗口。\n\n"
+            f"**主线**：{' → '.join([t['name'] for t in top3])}\n\n"
+            f"**策略**：龙头股明天如果有2%以内的开盘，可以直接上。"
+            f"重点盯前三个板块的领涨龙头（见上方龙头分析表）。"
+        )
     else:
-        st.error("**节奏**: 情绪偏冷。防守为主，减少开仓。守住已有的，不轻易加仓。")
+        st.warning(
+            f"**节奏**：涨停仅{limit_up}只，市场偏冷。\n\n"
+            f"**策略**：不开新仓。关注逆势抗跌的票（今日微涨或平盘的行业龙头），"
+            f"等情绪修复后第一时间切入。"
+        )
 
-    if themes:
-        top3 = themes[:3]
-        st.markdown("**主线方向**: " + " > ".join([f"{t['name']}({t['grade']})" for t in top3]))
-
+    # 候选池
+    dragon_heads = results.get("dragon_heads", {})
     if dragon_heads:
-        st.markdown("**候选池**: 上述龙头候选列表中综合分最高的3-5只，明天竞价确认强度后决定。")
+        candidates = []
+        for theme_name, heads in dragon_heads.items():
+            for h in heads[:2]:
+                if abs(h["chg_today"]) < 9.5 and h["composite"] > 0:
+                    candidates.append(f"{h['name']}({h['code']}) · {theme_name} · 分{h['composite']:.0f}")
 
-    st.info("⚠️ 以上为数据驱动的复盘参考，最终决策请结合你的盘感和交易纪律。")
+        if candidates:
+            st.success("**明日候选池（未涨停 + 高分）**:\n\n" + "\n".join(f"• {c}" for c in candidates[:8]))
 
-    # 导出按钮
+    st.caption("⚠️ 以上为数据参考，最终决策请结合盘感和纪律。")
+
+    # 导出
     st.divider()
+    csv_data = _export_to_csv(themes, dragon_heads, overview, fund_flow)
     st.download_button(
         "📥 导出复盘报告 (CSV)",
-        data=_export_to_csv(themes, dragon_heads, sentiment),
+        data=csv_data,
         file_name=f"review_{_get_today_date()}.csv",
         mime="text/csv",
     )
 
 
-def _export_to_csv(themes, dragon_heads, sentiment) -> str:
-    """导出CSV"""
-    lines = ["板块,类型,等级,强度分,涨跌幅"]
-    for t in themes:
-        lines.append(f'{t["name"]},{t["type"]},{t["grade"]},{t["score"]:.0f},{t["change_pct"]:+.2f}')
+# ============================================================
+# 辅助
+# ============================================================
+
+def _breadth_bar(ratio: float) -> str:
+    """涨跌比可视化"""
+    n = int(ratio * 10)
+    return "🟢" * n + "⚪" * (10 - n)
+
+
+def _export_to_csv(themes, dragon_heads, overview, fund_flow) -> str:
+    lines = ["=== 市场全景 ==="]
+    lines.append(f"上涨,{overview.get('up_count',0)}")
+    lines.append(f"下跌,{overview.get('down_count',0)}")
+    lines.append(f"涨停,{overview.get('limit_up',0)}")
+    lines.append(f"跌停,{overview.get('limit_down',0)}")
+    lines.append(f"情绪,{overview.get('mood','')}")
     lines.append("")
-    lines.append("板块,代码,名称,今日涨跌,5日涨幅,量比,位置,综合分")
+    lines.append("=== 主线板块 ===")
+    lines.append("板块,类型,强度,领涨龙头,涨幅")
+    for t in themes[:15]:
+        leader = f"{t.get('leader_name','')}({t.get('leader_code','')})"
+        lines.append(f"{t['name']},{t['type']},{t['score']:.0f},{leader},{t.get('leader_chg',0):+.2f}%")
+    lines.append("")
+    lines.append("=== 龙头个股 ===")
+    lines.append("板块,代码,名称,今日涨幅,20日涨幅,换手率,PE,市值(亿),主力净额(亿),综合分")
     for theme, heads in dragon_heads.items():
         for h in heads:
-            lines.append(f'{theme},{h["code"]},{h["name"]},{h["chg_today"]:+.2f},{h["chg_5d"]:+.2f},{h["vol_ratio"]:.1f},{h["position"]},{h["composite"]:.1f}')
+            lines.append(f"{theme},{h['code']},{h['name']},{h['chg_today']:+.2f},{h['chg_20d']:+.1f},{h['turnover']:.1f},{h['pe']:.1f},{h['mv_yi']:.0f},{h['net_flow_yi']:+.1f},{h['composite']:.1f}")
     lines.append("")
-    lines.append(f'情绪,{sentiment.get("mood","")},{sentiment.get("score","")}分,{sentiment.get("advice","")}')
+    lines.append("=== 资金净流入TOP ===")
+    for s in fund_flow.get("top_stocks", [])[:15]:
+        lines.append(f"{s['name']}({s['code']}),{s['net_flow_yi']:+.1f}亿,{s['flow_pct']:.1f}%")
     return "\n".join(lines)
 
-
-# ============================================================
-# 独立运行
-# ============================================================
 
 if __name__ == "__main__":
     render()
