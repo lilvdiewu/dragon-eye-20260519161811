@@ -28,7 +28,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "导航",
-        ["🏠 首页仪表盘", "🎯 智能选股", "🔥 板块热度", "🔍 全市场扫描", "📊 个股分析", "⚡ 策略回测", "🔔 通知设置"],
+        ["🏠 首页仪表盘", "🎯 智能选股", "🔥 板块热度", "🔍 全市场扫描", "📊 个股分析", "⚡ 策略回测", "📋 深度复盘", "🔔 通知设置"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -104,6 +104,9 @@ elif page == "📊 个股分析":
     render()
 elif page == "⚡ 策略回测":
     from pages.backtest import render
+    render()
+elif page == "📋 深度复盘":
+    from pages.daily_review import render
     render()
 elif page == "🔔 通知设置":
     from pages.push_settings import render
