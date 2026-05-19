@@ -610,8 +610,8 @@ class ThsSectorFetcher:
                 return results
 
             for _, row in df.iterrows():
-                name = str(row.get("板块", ""))
-                code = str(row.get("代码", ""))
+                # stock_board_concept_name_ths 返回列: name, code（无涨跌幅）
+                name = str(row.get("name", "") or row.get("板块", ""))
 
                 change = 0.0
                 change_str = str(row.get("涨跌幅", "0"))
@@ -623,7 +623,7 @@ class ThsSectorFetcher:
                 if name:
                     results.append(SectorStrength(
                         name=name,
-                        code=code,
+                        code=str(row.get("code", "") or row.get("代码", "")),
                         sector_type="concept",
                         change_pct=change,
                     ))
@@ -747,6 +747,7 @@ class ThsSectorFetcher:
     def _ak_with_timeout(self, fn, timeout=15):
         """在独立线程中执行AkShare调用，超时则返回None"""
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        import traceback as _tb
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(fn)
             try:
@@ -754,7 +755,9 @@ class ThsSectorFetcher:
             except FuturesTimeout:
                 print(f"[ThsSectorFetcher] AkShare调用超时({timeout}s)，已中断")
                 return None
-            except Exception:
+            except Exception as e:
+                print(f"[ThsSectorFetcher] AkShare线程异常: {e}")
+                _tb.print_exc()
                 return None
 
     def get_concept_summary(self) -> list[SectorStrength]:
