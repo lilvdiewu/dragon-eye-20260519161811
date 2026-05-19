@@ -5,7 +5,11 @@
 """
 from __future__ import annotations
 
+import json
 import time
+import tempfile
+from pathlib import Path
+
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
@@ -34,15 +38,39 @@ def _cached_industry_sectors() -> list:
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_concept_sectors() -> list:
     """缓存概念板块数据（5分钟过期）"""
-    from dragon_eye.sector.ths_sector import ThsSectorFetcher, SectorRanker
+    from dragon_eye.sector.ths_sector import ThsSectorFetcher, SectorRanker, SectorStrength
     fetcher = ThsSectorFetcher()
     ranker = SectorRanker()
 
-    sectors = fetcher.get_concept_summary()
-    if not sectors:
-        sectors = fetcher.get_concept_list()
+    # 本地缓存：概念数据一天内有效，避免每次重启都等AkShare
+    cache_dir = Path(tempfile.gettempdir()) / "dragon_eye"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "concept_cache.json"
+    cache_age = 86400  # 24h
+
+    if cache_file.exists():
+        try:
+            mtime = cache_file.stat().st_mtime
+            if time.time() - mtime < cache_age:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                sectors = cached.get("sectors", [])
+                return [SectorStrength(**s) for s in sectors]
+        except Exception:
+            pass
+
+    # 在线获取
+    sectors = fetcher.get_concept_list()
     if sectors:
         sectors = ranker.rank(sectors)
+
+        # 保存到本地缓存
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"sectors": [s.__dict__ for s in sectors], "cached_at": time.time()}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
     return sectors
 
 

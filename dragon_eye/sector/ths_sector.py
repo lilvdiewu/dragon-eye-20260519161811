@@ -600,16 +600,12 @@ class ThsSectorFetcher:
         return results
 
     def get_concept_list(self) -> list[SectorStrength]:
-        """获取同花顺概念板块列表
-
-        Returns:
-            概念板块强度列表
-        """
+        """获取同花顺概念板块列表（15s超时保护）"""
         ak = self._get_ak()
         results = []
 
         try:
-            df = ak.stock_board_concept_name_ths()
+            df = self._ak_with_timeout(lambda: ak.stock_board_concept_name_ths(), timeout=15)
             if df is None or df.empty:
                 return results
 
@@ -748,13 +744,26 @@ class ThsSectorFetcher:
 
         return results
 
+    def _ak_with_timeout(self, fn, timeout=15):
+        """在独立线程中执行AkShare调用，超时则返回None"""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(fn)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                print(f"[ThsSectorFetcher] AkShare调用超时({timeout}s)，已中断")
+                return None
+            except Exception:
+                return None
+
     def get_concept_summary(self) -> list[SectorStrength]:
-        """获取概念板块汇总"""
+        """获取概念板块汇总（15s超时保护）"""
         ak = self._get_ak()
         results = []
 
         try:
-            df = ak.stock_board_concept_summary_ths()
+            df = self._ak_with_timeout(lambda: ak.stock_board_concept_summary_ths(), timeout=15)
             if df is None or df.empty:
                 return results
 
