@@ -37,23 +37,40 @@ def _cached_industry_sectors() -> list:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_concept_sectors_tdx() -> list:
-    """从TDX本地 infoharbor_block.dat 加载概念板块（含成分股数）"""
+    """从TDX本地 infoharbor_block.dat 加载概念板块 + TDX动量"""
     from dragon_eye.sector.ths_sector import TdxSectorMapper, SectorStrength, SectorRanker
+    from dragon_eye.sector.tdx_sector_reader import TdxSectorReader
+    
     mapper = TdxSectorMapper()
-    mapper.load_infoharbor()  # 只加载概念数据，不拉行业
-
+    mapper.load_infoharbor()
+    
+    # 加载TDX动量数据
+    tdx = TdxSectorReader()
+    tdx.load_sector_map()
+    
     ranker = SectorRanker()
     sectors = []
     for concept_name, stocks in mapper._concept_map.items():
+        # 关联TDX动量
+        mom_3d, mom_5d, chg_pct = 0.0, 0.0, 0.0
+        tdx_code = tdx.get_code(concept_name)
+        if tdx_code:
+            mom = tdx.get_momentum(concept_name)
+            if mom:
+                chg_pct = mom.get("change_pct", 0.0)
+                mom_3d = mom.get("momentum_3d", 0.0)
+                mom_5d = mom.get("momentum_5d", 0.0)
+        
         s = SectorStrength(
             name=concept_name,
             sector_type="concept",
-            change_pct=0,
+            change_pct=chg_pct,
             net_inflow=0,
             turnover=0,
-            up_ratio=len(stocks) / 5000,  # 覆盖度指标
+            momentum_3d=mom_3d,
+            momentum_5d=mom_5d,
+            up_ratio=len(stocks) / 5000,
         )
-        # 动态加成分股数
         s.stock_count = len(stocks)
         sectors.append(s)
 
